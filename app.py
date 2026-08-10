@@ -400,7 +400,7 @@ def stop_asr_watcher():
 # --- 场次数据 ---
 @app.get("/api/recording/status")
 def recording_status():
-    """检查录屏状态（优先检查 DouyinLiveRecorder，其次检查 collector 的 ffmpeg 输出）"""
+    """检查录屏状态：检查进程是否存活，而非仅检查文件是否存在"""
     import subprocess
     result = {"running": False, "latest_file": "", "total_files": 0, "total_mb": 0}
     try:
@@ -411,16 +411,40 @@ def recording_status():
                  "(Get-Process -Name 'DouyinLiveRecorder' -ErrorAction SilentlyContinue | Measure-Object).Count"],
                 capture_output=True, text=True, timeout=5
             )
-            result["running"] = proc.stdout.strip() != "0"
+            if proc.stdout.strip() not in ("0", ""):
+                result["running"] = True
+                result["source"] = "DouyinLiveRecorder"
         except (FileNotFoundError, Exception):
-            # 非 Windows 或 powershell 不可用，检查 collector 的 ffmpeg 进程
             pass
 
-        # 检查 collector 的 ffmpeg 录制输出（data/videos/）
+        # 检查 ffmpeg 进程是否正在录制（通过检查进程命令行参数）
+        if not result["running"]:
+            try:
+                # Linux/macOS: 检查 ffmpeg 进程
+                proc = subprocess.run(
+                    ["pgrep", "-f", "ffmpeg.*data/videos"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    result["running"] = True
+                    result["source"] = "ffmpeg"
+            except (FileNotFoundError, Exception):
+                # Windows: 用 tasklist 检查
+                try:
+                    proc = subprocess.run(
+                        ["tasklist", "/FI", "IMAGENAME eq ffmpeg.exe"],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if "ffmpeg.exe" in proc.stdout:
+                        result["running"] = True
+                        result["source"] = "ffmpeg"
+                except Exception:
+                    pass
+
+        # 检查 collector 的视频输出目录（仅报告文件信息，不用于判断录制状态）
         collector_video_dir = str(DATA_DIR / "videos")
         if os.path.isdir(collector_video_dir):
             import datetime as _dt
-            today = _dt.datetime.now().strftime("%Y-%m-%d")
             files = []
             for root, dirs, filenames in os.walk(collector_video_dir):
                 for f in filenames:
@@ -436,10 +460,6 @@ def recording_status():
                 total_size = sum(f[1] for f in files)
                 result["total_files"] = len(files)
                 result["total_mb"] = round(total_size / 1048576, 1)
-                # 如果有 ffmpeg 输出，认为录制在进行
-                if not result["running"]:
-                    result["running"] = True
-                    result["source"] = "ffmpeg"
 
         # 也检查 Windows 录屏目录
         try:
@@ -460,7 +480,6 @@ def recording_status():
                     result["latest_time"] = _dt.datetime.fromtimestamp(latest[2]).strftime("%H:%M:%S")
                     result["total_files"] = len(win_files)
                     result["total_mb"] = round(sum(f[1] for f in win_files) / 1048576, 1)
-                    result["source"] = "DouyinLiveRecorder"
         except Exception:
             pass
 
@@ -471,6 +490,12 @@ def recording_status():
 @app.get("/api/sessions")
 def list_sessions(limit: int = 30):
     """读取采集历史。优先从本地 DB 读取，备选从 douyin-live-toolkit DB 读取。"""
+    # 检查当前采集器是否在运行
+    global _current_collector
+    active_session_id = None
+    if _current_collector and _current_collector.session_id:
+        active_session_id = _current_collector.session_id
+
     # 优先从本地 SQLite 读取
     with get_session() as db:
         local_sessions = db.query(Session).order_by(desc(Session.started_at)).limit(limit).all()
@@ -482,11 +507,30 @@ def list_sessions(limit: int = 30):
                 peak_online = db.query(func.max(LiveEvent.content)).filter(
                     LiveEvent.session_id == s.id, LiveEvent.event_type == "room_stat"
                 ).scalar() or 0
+
+                # 格式化时间
+                started_at_str = ""
+                if s.started_at:
+                    if hasattr(s.started_at, 'strftime'):
+                        started_at_str = s.started_at.strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        started_at_str = str(s.started_at)
+
+                ended_at_str = None
+                if s.ended_at:
+                    if hasattr(s.ended_at, 'strftime'):
+                        ended_at_str = s.ended_at.strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        ended_at_str = str(s.ended_at)
+                elif s.id != active_session_id:
+                    # 如果采集器没在运行这个 session，标记为已结束
+                    ended_at_str = "异常结束"
+
                 result.append({
                     "id": s.id, "live_id": s.live_id, "room_title": s.room_title or "",
                     "anchor_name": s.anchor_name or "",
-                    "started_at": str(s.started_at) if s.started_at else "",
-                    "ended_at": str(s.ended_at) if s.ended_at else None,
+                    "started_at": started_at_str,
+                    "ended_at": ended_at_str,
                     "chat_count": chat_count, "member_count": member_count,
                     "peak_online": peak_online if isinstance(peak_online, int) else 0,
                 })

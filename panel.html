@@ -45,6 +45,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .tag{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:500}
 .tag-live{background:#dcfce7;color:#166534}
 .tag-end{background:#f1f5f9;color:#64748b}
+.tag-error{background:#fef2f2;color:#dc2626}
 .his-link{color:#6366f1;cursor:pointer;text-decoration:none}
 .his-link:hover{text-decoration:underline}
 
@@ -360,7 +361,10 @@ async function loadHistory(){
   try{
     var sessions=await(await fetch('/api/sessions')).json();
     var h='';sessions.forEach(function(s){
-      h+='<tr><td>#'+s.id+'</td><td><a class=his-link onclick="$(\"liveId\").value=\"'+e(s.live_id)+'\";$(\"anchor\").value=\"'+e(s.anchor_name||'')+'\";switchTab(\"live\")">'+e(s.anchor_name||s.live_id)+'</a></td><td>'+(s.started_at||'').substring(0,16)+'</td><td>'+s.chat_count+'</td><td>'+s.member_count+'</td><td>'+s.peak_online+'</td><td><span class="tag '+(s.ended_at?'tag-end':'tag-live')+'">'+(s.ended_at?'已结束':'采集中')+'</span></td><td><a class=his-link onclick="viewSession('+s.id+')">详情</a></td></tr>';
+      var statusText='采集中',statusClass='tag-live';
+      if(s.ended_at==='异常结束'){statusText='异常结束';statusClass='tag-error'}
+      else if(s.ended_at){statusText='已结束';statusClass='tag-end'}
+      h+='<tr><td>#'+s.id+'</td><td><a class=his-link onclick="$(\"liveId\").value=\"'+e(s.live_id)+'\";$(\"anchor\").value=\"'+e(s.anchor_name||'')+'\";switchTab(\"live\")">'+e(s.anchor_name||s.live_id)+'</a></td><td>'+(s.started_at||'').substring(0,16)+'</td><td>'+s.chat_count+'</td><td>'+s.member_count+'</td><td>'+s.peak_online+'</td><td><span class="tag '+statusClass+'">'+statusText+'</span></td><td><a class=his-link onclick="viewSession('+s.id+')">详情</a></td></tr>';
     });
     $('hisList').innerHTML=h||'<tr><td colspan=8 class=empty>暂无历史场次</td></tr>';
   }catch(e){}

@@ -465,6 +465,8 @@ class LiveCollector:
             ws_signature = self._generate_ws_signature(wss_url)
         except Exception as exc:
             logger.error("WS 签名生成失败，无法连接: %s", exc)
+            self.status = "error"
+            self.error_message = f"WebSocket 签名生成失败: {exc}"
             return
 
         wss_url = (
@@ -505,6 +507,10 @@ class LiveCollector:
 
         def on_error(ws, error):
             logger.warning("WebSocket 错误: %s", error)
+            # 如果还没连接成功就出错，标记为 error
+            if not self.ws_connected:
+                self.status = "error"
+                self.error_message = f"WebSocket 连接失败: {error}"
 
         def on_close(ws, close_status_code, close_msg):
             logger.info("WebSocket 关闭: code=%s msg=%s", close_status_code, close_msg)
@@ -535,6 +541,8 @@ class LiveCollector:
                     time.sleep(5)
         except Exception as exc:
             logger.error("WebSocket 连接失败: %s", exc)
+            self.status = "error"
+            self.error_message = f"WebSocket 连接失败: {exc}"
 
         logger.info("WebSocket 线程退出")
 
