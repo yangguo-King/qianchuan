@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang=zh>
+<head>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>直播复盘</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f1f5f9;color:#1e293b;min-height:100vh}
+.toolbar{display:flex;align-items:center;gap:10px;padding:12px 20px;background:#fff;border-bottom:1px solid #e2e8f0;position:sticky;top:0;z-index:10}
+.toolbar h1{font-size:16px;font-weight:700;margin-right:auto;display:flex;align-items:center;gap:8px}
+.toolbar h1 span{width:28px;height:28px;background:#1e293b;color:#fff;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:14px}
+.toolbar select,.toolbar input{font-size:13px;padding:6px 10px;border:1px solid #d1d5db;border-radius:6px;outline:none}
+.toolbar select:focus,.toolbar input:focus{border-color:#6366f1;box-shadow:0 0 0 2px #e0e7ff}
+.toolbar button{font-size:13px;padding:6px 14px;border:none;border-radius:6px;cursor:pointer;font-weight:500;transition:all .15s}
+.toolbar button:hover{opacity:.9}
+.toolbar button:disabled{opacity:.5;cursor:not-allowed}
+.btn-primary{background:#6366f1;color:#fff}
+.btn-stop{background:#ef4444;color:#fff}
+.tabs{display:flex;gap:0;padding:0 20px;background:#fff;border-bottom:1px solid #e2e8f0}
+.tab{padding:12px 20px;font-size:13px;font-weight:500;color:#64748b;cursor:pointer;border-bottom:2px solid transparent}
+.tab:hover{color:#1e293b}
+.tab.active{color:#6366f1;border-bottom-color:#6366f1}
+.content{padding:20px;max-width:1200px;margin:0 auto}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:20px}
+.card{background:#fff;border-radius:10px;padding:20px;border:1px solid #e2e8f0}
+.card h3{font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px}
+.card .val{font-size:28px;font-weight:700}
+.card .sub{font-size:12px;color:#94a3b8;margin-top:4px}
+
+.dm-list{background:#fff;border-radius:10px;border:1px solid #e2e8f0;overflow:hidden}
+.dm-list h3{padding:14px 20px;border-bottom:1px solid #f1f5f9;font-size:14px;font-weight:600}
+.dm-item{display:flex;gap:12px;padding:10px 20px;border-bottom:1px solid #f8fafc;font-size:13px}
+.dm-item:nth-child(even){background:#f8fafc}
+.dm-user{color:#6366f1;font-weight:500;white-space:nowrap;min-width:80px}
+.dm-text{color:#475569;flex:1}
+.dm-time{color:#94a3b8;font-size:11px;white-space:nowrap}
+
+/* history table */
+.his-table{width:100%;border-collapse:collapse;font-size:13px}
+.his-table th{padding:10px 14px;text-align:left;color:#64748b;font-weight:500;border-bottom:2px solid #e2e8f0;font-size:11px;text-transform:uppercase}
+.his-table td{padding:10px 14px;border-bottom:1px solid #f1f5f9;color:#475569}
+.his-table tr:hover{background:#f8fafc}
+.tag{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:500}
+.tag-live{background:#dcfce7;color:#166534}
+.tag-end{background:#f1f5f9;color:#64748b}
+.his-link{color:#6366f1;cursor:pointer;text-decoration:none}
+.his-link:hover{text-decoration:underline}
+
+/* settings */
+.set-group{margin-bottom:24px}
+.set-group h3{font-size:14px;font-weight:600;margin-bottom:12px;color:#1e293b}
+.set-field{margin-bottom:14px}
+.set-field label{display:block;font-size:12px;font-weight:500;color:#64748b;margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px}
+.set-field input,.set-field textarea{width:100%;padding:8px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;outline:none}
+.set-field input:focus,.set-field textarea:focus{border-color:#6366f1;box-shadow:0 0 0 2px #e0e7ff}
+.set-field textarea{resize:vertical;min-height:80px;font-family:monospace}
+.set-msg{font-size:12px;padding:4px 0;color:#16a34a}
+
+.auth-box{background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:12px;margin-bottom:16px}
+.auth-box input{font-size:13px;padding:6px 10px;border:1px solid #d1d5db;border-radius:6px;flex:1}
+.hidden{display:none}
+.empty{text-align:center;color:#94a3b8;padding:40px 20px;font-size:14px}
+#recordingStatus{font-size:11px;padding:2px 8px;border-radius:10px;margin-left:8px}
+.rec-on{background:#dcfce7;color:#166534}
+
+.transcript-box{background:#fff;border-radius:10px;border:1px solid #e2e8f0;overflow:hidden;margin-top:16px}
+.transcript-box h3{padding:14px 20px;border-bottom:1px solid #f1f5f9;font-size:14px;font-weight:600}
+.transcript-text{padding:16px;font-size:14px;line-height:2;color:#334155;white-space:pre-wrap;max-height:300px;overflow-y:auto}
+</style>
+</head>
+<body>
+
+<div class=toolbar>
+  <h1><span>&#9654;</span> 直播复盘</h1>
+  <select id=sel onchange="onSelect()"><option value="">选账号</option></select>
+  <input id=liveId placeholder="直播间ID" size=18>
+  <input id=anchor placeholder="主播名" size=10>
+  <button class=btn-primary id=startBtn onclick=start()>开始采集</button>
+  <button class=btn-stop id=stopBtn onclick=stop() disabled>停止</button>
+  <button id=douyinBtn onclick=openDouyin() style=background:#475569>直播间</button>
+  <button id=recBtn onclick=toggleRecording() style=background:#dc2626;color:#fff>录屏</button>
+  <button id=authBtn onclick=showAuth() style=background:#f59e0b;color:#000>千川授权</button>
+  <span id=recordingStatus></span>
+</div>
+
+<div class=tabs>
+  <div class="tab active" data-tab=live onclick=switchTab('live')>实时监控</div>
+  <div class=tab data-tab=history onclick=switchTab('history')>历史场次</div>
+  <div class=tab data-tab=settings onclick=switchTab('settings')>系统设置</div>
+</div>
+
+<div class=content>
+
+<!-- auth panel -->
+<div id=authPanel class="auth-box hidden">
+  <div style="font-size:13px;color:#1e40af;margin-bottom:8px">授权后将浏览器地址栏完整URL粘贴到下方自动兑换</div>
+  <div style=display:flex;gap:8px>
+    <input id=authCodeInput placeholder="粘贴回调地址 (含 auth_code=)" style=flex:1>
+    <button class=btn-primary id=authSubmitBtn onclick=exchangeAuthCode() style=font-size:12px>兑换</button>
+  </div>
+</div>
+
+<!-- LIVE TAB -->
+<div id=tabLive>
+  <div class=grid4>
+    <div class=card><h3>弹幕数</h3><div class=val id=chat>-</div></div>
+    <div class=card><h3>进场人数</h3><div class=val id=member>-</div></div>
+    <div class=card><h3>在线峰值</h3><div class=val id=peak>-</div></div>
+    <div class=card><h3>点赞</h3><div class=val id=likes>-</div></div>
+  </div>
+  <div class=grid4>
+    <div class=card><h3>千川 消耗</h3><div class=val id=qcCost>-</div></div>
+    <div class=card><h3>千川 GMV</h3><div class=val id=qcGmv>-</div></div>
+    <div class=card><h3>千川 ROI</h3><div class=val id=qcRoi>-</div></div>
+    <div class=card><h3>千川 订单</h3><div class=val id=qcOrders>-</div></div>
+  </div>
+  <div class=grid2>
+    <div class=dm-list>
+      <h3>最新弹幕</h3>
+      <div id=dmList><div class=empty>暂无弹幕</div></div>
+    </div>
+    <div class=card>
+      <h3>录屏状态 <span id=recStatus style=font-weight:400></span></h3>
+      <div class=val id=recFile style=font-size:14px>-</div>
+      <div class=sub id=recInfo></div>
+      <div id=recPreview style=margin-top:8px></div>
+    </div>
+  </div>
+  <div class=grid2 style=grid-template-columns:1fr>
+    <div class="transcript-box">
+      <h3>实时话术转写 <span style=font-weight:400;color:#94a3b8;font-size:12px>每15秒自动检测</span></h3>
+      <div class=transcript-text id=transcriptContent>等待录屏段落...</div>
+    </div>
+  </div>
+  <div class=grid2>
+    <div class=card>
+      <h3>主播状态分析 <span style=font-weight:400;color:#94a3b8;font-size:12px>千问 VL 视觉识别</span></h3>
+      <div class=transcript-text id=visionContent style=max-height:200px>等待视觉分析...</div>
+    </div>
+  </div>
+</div>
+
+<!-- HISTORY TAB -->
+<div id=tabHistory class=hidden>
+  <div class=card style=margin-bottom:16px>
+    <table class=his-table><thead><tr>
+      <th>场次</th><th>直播间</th><th>时间</th><th>弹幕</th><th>进场</th><th>峰值</th><th>状态</th><th>操作</th>
+    </tr></thead><tbody id=hisList></tbody></table>
+    <div id=hisLoading class=empty>加载中...</div>
+  </div>
+</div>
+
+<!-- SETTINGS TAB (蒸馏自 AI-Live-Review) -->
+<div id=tabSettings class=hidden>
+  <div class=card>
+    <div class=set-group>
+      <h3>AI 配置</h3>
+      <div class=set-field>
+        <label>DashScope API Key</label>
+        <input type=password id=setApiKey placeholder="sk-...">
+      </div>
+      <button class=btn-primary onclick=saveApiKey() style=font-size:12px>保存 API Key</button>
+    </div>
+  </div>
+  <div class=card style=margin-top:16px>
+    <div class=set-group>
+      <h3>AI 提示词配置</h3>
+      <div class=set-field>
+        <label>转录分析提示词</label>
+        <textarea id=setPrompt1 rows=4></textarea>
+      </div>
+      <div class=set-field>
+        <label>视觉分析提示词</label>
+        <textarea id=setPrompt2 rows=3></textarea>
+      </div>
+      <div class=set-field>
+        <label>总结报告提示词</label>
+        <textarea id=setPrompt3 rows=6></textarea>
+      </div>
+      <div class=set-msg id=setMsg></div>
+      <button class=btn-primary onclick=savePrompts() style=font-size:12px>保存提示词配置</button>
+    </div>
+  </div>
+</div>
+
+</div>
+
+<script>
+var timer,sessionId,running=false,currentTab='live',_tsPoll=null;
+
+function $(id){return document.getElementById(id)}
+
+function switchTab(t){
+  currentTab=t;
+  document.querySelectorAll('.tab').forEach(function(el){el.classList.toggle('active',el.dataset.tab===t)})
+  $('tabLive').classList.toggle('hidden',t!=='live');
+  $('tabHistory').classList.toggle('hidden',t!=='history');
+  $('tabSettings').classList.toggle('hidden',t!=='settings');
+  if(t==='history')loadHistory();
+  if(t==='settings')loadSettings();
+}
+
+// ---- auth ----
+function showAuth(){$('authPanel').classList.toggle('hidden')}
+
+async function exchangeAuthCode(){
+  var raw=$('authCodeInput').value.trim();
+  if(!raw){alert('请粘贴完整回调地址');return}
+  var m=raw.match(/[?&](?:auth_)?code=([^&]+)/);
+  var code=m?m[1]:raw;
+  var btn=$('authSubmitBtn');btn.disabled=true;
+  try{
+    var r=await fetch('/auth-callback?code='+encodeURIComponent(code));
+    if(r.ok){alert('授权成功!');location.reload()}
+    else{var t=await r.text();alert('失败')}
+  }catch(e){alert(e.message)}
+  btn.disabled=false;
+}
+
+// ---- accounts ----
+async function loadAccounts(){
+  try{
+    var accounts=await (await fetch('/api/accounts')).json();
+    var sel=$('sel');sel.innerHTML='<option value="">选账号</option>';
+    accounts.forEach(function(a){
+      sel.innerHTML+='<option value="'+e(a.live_id)+'" data-anchor="'+e(a.anchor_name||'')+'">'+e(a.anchor_name||a.live_id)+' ('+e(a.live_id)+')</option>';
+    });
+  }catch(e){}
+}
+function onSelect(){
+  var o=$('sel').selectedOptions[0];
+  if(o&&o.value){$('liveId').value=o.value;$('anchor').value=o.dataset.anchor||''}
+}
+
+// ---- collect ----
+async function start(){
+  var liveId=$('liveId').value.trim();
+  if(!liveId){alert('选或输入直播间ID');return}
+  try{
+    var d=await (await fetch('/api/collect/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({live_id:liveId,anchor_name:$('anchor').value||liveId})})).json();
+    if(d.ok){
+      $('startBtn').disabled=true;$('stopBtn').disabled=false;$('recordingStatus').textContent='采集中';$('recordingStatus').className='rec-on';
+      running=true;update();if(!timer)timer=setInterval(update,5000);
+      fetch('/api/recording/start?live_id='+encodeURIComponent(liveId),{method:'POST'}).catch(function(){});
+      fetch('/api/asr/start',{method:'POST'}).catch(function(){});
+      $('recBtn').style.background='#16a34a';$('recBtn').textContent='录屏中';
+    }else{alert(d.detail||'失败')}
+  }catch(e){alert(e.message)}
+}
+
+async function stop(){
+  try{await fetch('/api/collect/stop',{method:'POST'});await fetch('/api/recording/stop',{method:'POST'}).catch(function(){});}
+  catch(e){}
+  $('startBtn').disabled=false;$('stopBtn').disabled=true;$('recordingStatus').textContent='';$('recordingStatus').className='';
+  $('recBtn').style.background='#dc2626';$('recBtn').textContent='录屏';running=false;sessionId=null;
+}
+
+async function toggleRecording(){
+  var liveId=$('liveId').value.trim(),btn=$('recBtn');
+  if(btn.textContent==='录屏中'){
+    btn.disabled=true;try{await fetch('/api/recording/stop',{method:'POST'});btn.style.background='#dc2626';btn.textContent='录屏'}catch(e){}
+    btn.disabled=false;
+  }else{
+    if(!liveId){alert('先选账号');return}
+    btn.disabled=true;
+    try{var d=await(await fetch('/api/recording/start?live_id='+encodeURIComponent(liveId),{method:'POST'})).json();if(d.ok){btn.style.background='#16a34a';btn.textContent='录屏中'}else{alert(d.detail||'失败')}}catch(e){alert(e.message)}
+    btn.disabled=false;
+  }
+}
+
+function openDouyin(){var id=$('liveId').value.trim();if(id)window.open('https://live.douyin.com/'+id,'_blank')}
+
+// ---- update live ----
+async function update(){
+  // 隐藏标签页不轮询, 减少后台资源占用
+  if(document.hidden)return;
+  try{
+    var s=await(await fetch('/api/session/current')).json();
+    if(s.id){
+      sessionId=s.id;
+      // 并行请求 stats, events, qianchuan, recording, transcript
+      var [statsR,evtsR,qcR,rcR,tR]=await Promise.all([
+        fetch('/api/session/'+s.id+'/stats'),
+        fetch('/api/session/'+s.id+'/events?type=chat&limit=20'),
+        fetch('/api/qianchuan/live?sid='+s.id),
+        fetch('/api/recording/status'),
+        fetch('/api/session/'+s.id+'/transcript/latest')
+      ]);
+      var [stats,evts,qc,rc,t]=await Promise.all([statsR,evtsR,qcR,rcR,tR].map(function(r){return r.json().catch(function(){return{}})}));
+
+      $('chat').textContent=stats.chat_count||'-';$('member').textContent=stats.member_count||'-';
+      $('peak').textContent=stats.peak_online||'-';$('likes').textContent=stats.like_total||'-';
+
+      var h='';evts.forEach(function(ev){h+='<div class=dm-item><span class=dm-user>'+e(ev.user_name)+'</span><span class=dm-text>'+e(ev.content)+'</span><span class=dm-time>'+(ev.received_at||'').substring(11,19)+'</span></div>'});
+      $('dmList').innerHTML=h||'<div class=empty>暂无弹幕</div>';
+
+      $('qcCost').textContent=qc.cost!=null?'¥'+Number(qc.cost).toLocaleString():'-';
+      $('qcGmv').textContent=qc.gmv!=null?'¥'+Number(qc.gmv).toLocaleString():'-';
+      $('qcRoi').textContent=qc.roi!=null?qc.roi:'-';
+      $('qcOrders').textContent=qc.orders!=null?qc.orders:'-';
+
+      $('recStatus').textContent=rc.running?'录制中':'未启动';
+      $('recStatus').style.color=rc.running?'#166534':'#94a3b8';
+      if(rc.running){$('recBtn').style.background='#16a34a';$('recBtn').textContent='录屏中'}
+      else{$('recBtn').style.background='#dc2626';$('recBtn').textContent='录屏'}
+      if(rc.latest_file){$('recFile').textContent=rc.latest_file;$('recInfo').textContent=rc.latest_mb+'MB | '+rc.latest_time+' | 今天'+rc.total_files+'段 '+rc.total_mb+'MB'}
+      else{$('recFile').textContent='-';$('recInfo').textContent=''}
+
+      if(t.text){$('transcriptContent').textContent=t.text;$('transcriptContent').style.color='#334155'}
+      else if(!running){$('transcriptContent').textContent='等待录屏段落...';$('transcriptContent').style.color='#94a3b8'}
+      if(t.vision_text){$('visionContent').textContent=t.vision_text;$('visionContent').style.color='#334155'}
+      else if(!running){$('visionContent').textContent='等待视觉分析...';$('visionContent').style.color='#94a3b8'}
+
+      if(!running&&!$('stopBtn').disabled){$('recordingStatus').textContent='采集中';$('recordingStatus').className='rec-on';$('startBtn').disabled=true;$('stopBtn').disabled=false;running=true}
+    }
+  }catch(e){}
+}
+
+// ---- history ----
+async function loadHistory(){
+  $('hisLoading').classList.remove('hidden');
+  try{
+    var sessions=await(await fetch('/api/sessions')).json();
+    var h='';sessions.forEach(function(s){
+      h+='<tr><td>#'+s.id+'</td><td><a class=his-link onclick="$(\"liveId\").value=\"'+e(s.live_id)+'\";$(\"anchor\").value=\"'+e(s.anchor_name||'')+'\";switchTab(\"live\")">'+e(s.anchor_name||s.live_id)+'</a></td><td>'+(s.started_at||'').substring(0,16)+'</td><td>'+s.chat_count+'</td><td>'+s.member_count+'</td><td>'+s.peak_online+'</td><td><span class="tag '+(s.ended_at?'tag-end':'tag-live')+'">'+(s.ended_at?'已结束':'采集中')+'</span></td><td><a class=his-link onclick="viewSession('+s.id+')">详情</a></td></tr>';
+    });
+    $('hisList').innerHTML=h||'<tr><td colspan=8 class=empty>暂无历史场次</td></tr>';
+  }catch(e){}
+  $('hisLoading').classList.add('hidden');
+}
+function viewSession(sid){sessionId=sid;switchTab('live');update()}
+
+// ---- settings (蒸馏自 AI-Live-Review) ----
+async function loadSettings(){
+  try{
+    var s=await(await fetch('/api/settings?keys=dashscope_api_key,prompt_transcript,prompt_vision,prompt_summary')).json();
+    $('setApiKey').value=s.dashscope_api_key||'';
+    $('setPrompt1').value=s.prompt_transcript||'';
+    $('setPrompt2').value=s.prompt_vision||'';
+    $('setPrompt3').value=s.prompt_summary||'';
+  }catch(e){}
+}
+async function saveApiKey(){
+  try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dashscope_api_key:$('setApiKey').value})});$('setMsg').textContent='API Key 已保存'}catch(e){$('setMsg').textContent='保存失败: '+e.message}
+}
+async function savePrompts(){
+  try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt_transcript:$('setPrompt1').value,prompt_vision:$('setPrompt2').value,prompt_summary:$('setPrompt3').value})});$('setMsg').textContent='提示词已保存'}catch(e){$('setMsg').textContent='保存失败: '+e.message}
+}
+
+function e(s){if(!s)return'';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
+
+window.onload=function(){loadAccounts();update();timer=setInterval(update,5000)};
+</script>
+</body>
+</html>
