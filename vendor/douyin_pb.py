@@ -450,13 +450,13 @@ class Against(betterproto.Message):
     left_name: str = betterproto.string_field(1)
     left_logo: "Image" = betterproto.message_field(2)
     left_goal: str = betterproto.string_field(3)
-    left_player_list: bytes = betterproto.bytes_field(4)
-    left_goal_stage_detail: bytes = betterproto.bytes_field(5)
+    # LeftPlayersList leftPlayersList = 4;  LeftGoalStageDetail
+    # leftGoalStageDetail = 5;
     right_name: str = betterproto.string_field(6)
     right_logo: "Image" = betterproto.message_field(7)
     right_goal: str = betterproto.string_field(8)
-    right_player_list: bytes = betterproto.bytes_field(9)
-    right_goal_stage_detail: bytes = betterproto.bytes_field(10)
+    # RightPlayersList rightPlayersList  = 9;  RightGoalStageDetail
+    # rightGoalStageDetail = 10;
     timestamp: int = betterproto.uint64_field(11)
     version: int = betterproto.uint64_field(12)
     left_team_id: int = betterproto.uint64_field(13)
