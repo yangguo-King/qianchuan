@@ -867,3 +867,13 @@ async def serve_panel():
     if PANEL_PATH.exists():
         return FileResponse(str(PANEL_PATH))
     return JSONResponse({"error": "panel.html not found"}, 404)
+
+# --- 启动入口 ---
+if __name__ == "__main__":
+    import argparse
+    import uvicorn
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=9999)
+    parser.add_argument("--host", default="0.0.0.0")
+    args = parser.parse_args()
+    uvicorn.run("app:app", host=args.host, port=args.port, reload=False)
