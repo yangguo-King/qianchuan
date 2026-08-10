@@ -36,6 +36,10 @@ A_BOGUS_JS = Path(__file__).parent / "vendor" / "a_bogus.js"
 DOUYIN_PB = Path(__file__).parent / "vendor" / "douyin_pb.py"
 X_BOGUS_JS = Path(__file__).parent / "vendor" / "x-bogus.js"
 
+# 导入新的纯 Python 签名算法（来自 DouyinLiveRecorder）
+sys.path.insert(0, str(Path(__file__).parent / "vendor"))
+from ab_sign import ab_sign as generate_ab_signature
+
 # ---------------------------------------------------------------------------
 # 通过 importlib 加载 vendor/douyin_pb.py（路径含连字符）
 # ---------------------------------------------------------------------------
@@ -160,11 +164,8 @@ class LiveCollector:
         # ffmpeg 进程
         self._ffmpeg_proc: Optional[subprocess.Popen] = None
 
-        # MiniRacer – 加载 sign.js
-        self._mr = MiniRacer()
-        with open(SIGN_JS, "r", encoding="utf-8") as f:
-            self._mr.eval(f.read())
-        logger.info("MiniRacer 已初始化，sign.js 已加载")
+        # 签名算法已改用纯 Python 实现 (ab_sign)，不再需要 MiniRacer
+        logger.info("使用纯 Python 签名算法 (ab_sign)")
 
     # ------------------------------------------------------------------
     # 公开 API
@@ -399,46 +400,22 @@ class LiveCollector:
         return room_id, room_title
 
     def _generate_ws_signature(self, wss_url: str) -> str:
-        """生成 WebSocket 签名: 解析URL参数 → 按序排列 → MD5 → MiniRacer get_sign。"""
+        """生成 WebSocket 签名: 使用纯 Python 实现的 ab_sign 算法。"""
         import urllib.parse as ulib_parse
 
         parsed = ulib_parse.urlparse(wss_url)
-        params = parsed.query.split("&")
-        param_map = {}
-        for p in params:
-            if "=" in p:
-                k, v = p.split("=", 1)
-                param_map[k] = v
-
-        _ORDER = [
-            "live_id", "aid", "version_code", "webcast_sdk_version",
-            "room_id", "sub_room_id", "sub_channel_id", "did_rule",
-            "user_unique_id", "device_platform", "device_type", "ac",
-            "identity",
-        ]
-        ordered = [f"{k}={param_map.get(k, '')}" for k in _ORDER]
-        md5_param = hashlib.md5(",".join(ordered).encode()).hexdigest()
-
-        return self._mr.call("get_sign", md5_param)
+        url_params = parsed.query
+        
+        # 使用新的纯 Python 签名算法
+        signature = generate_ab_signature(url_params, USER_AGENT)
+        logger.debug("Generated ab_sign: %s...", signature[:20] if signature else "None")
+        return signature
 
     def _generate_ac_credentials(self) -> Tuple[str, str]:
         """生成 __ac_nonce 和 __ac_signature（用于 WS cookie）。"""
         nonce = "".join(random.choices(string.ascii_lowercase + string.digits, k=11))
-        ac_signature = ""
-        try:
-            result = self._mr.eval("typeof crawler !== 'undefined' ? crawler.sign('') : ''")
-            if result and isinstance(result, str) and len(result) > 5:
-                ac_signature = result
-        except Exception:
-            try:
-                raw = self._mr.eval(
-                    "JSON.stringify(crawler({url: 'https://live.douyin.com/%s'}))" % self.live_id
-                )
-                obj = json.loads(raw) if raw else {}
-                ac_signature = obj.get("__ac_signature", "")
-            except Exception:
-                pass
-
+        # 使用 ab_sign 生成 ac_signature
+        ac_signature = generate_ab_signature("", USER_AGENT)
         return nonce, ac_signature
 
     def _connect_ws(self) -> None:
