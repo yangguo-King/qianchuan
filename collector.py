@@ -146,6 +146,12 @@ class LiveCollector:
         self.start_time: Optional[datetime] = None
         self.video_path: Optional[str] = None
 
+        # 采集状态（供前端轮询）
+        self.status: str = "init"  # init / connecting / running / error / stopped
+        self.error_message: str = ""
+        self.ws_connected: bool = False
+        self.events_received: int = 0
+
         # 线程控制
         self._ws_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -166,54 +172,75 @@ class LiveCollector:
 
     def start(self) -> None:
         """启动采集：解析房间 -> 建 DB 记录 -> WS 线程 -> [录制]。"""
-        logger.info("开始采集 live_id=%s", self.live_id)
+        try:
+            self.status = "connecting"
+            logger.info("开始采集 live_id=%s", self.live_id)
 
-        # 1. 解析房间 ID
-        self.room_id, self.room_title = self._resolve_room_id()
-        logger.info("房间 ID=%s  标题=%s", self.room_id, self.room_title)
+            # 1. 解析房间 ID
+            self.room_id, self.room_title = self._resolve_room_id()
+            logger.info("房间 ID=%s  标题=%s", self.room_id, self.room_title)
 
-        # 2. 写入 sessions 表
-        with get_session() as db:
-            session = Session(
-                live_id=self.live_id,
-                room_id=self.room_id,
-                anchor_name=self.anchor_name or "",
-                room_title=self.room_title or "",
-                started_at=datetime.now(),
-                cookie_file=self.cookie_file,
-                is_active=1,
+            # 2. 写入 sessions 表
+            with get_session() as db:
+                session = Session(
+                    live_id=self.live_id,
+                    room_id=self.room_id,
+                    anchor_name=self.anchor_name or "",
+                    room_title=self.room_title or "",
+                    started_at=datetime.now(),
+                    cookie_file=self.cookie_file,
+                    is_active=1,
+                )
+                db.add(session)
+                db.commit()
+                db.refresh(session)
+                self.session_id = session.id
+                logger.info("DB session id=%d 已创建", self.session_id)
+
+            self.start_time = datetime.now()
+
+            # 3. 启动 WebSocket（子线程）
+            self._stop_event.clear()
+            self._ws_thread = threading.Thread(
+                target=self._connect_ws,
+                name="ws-douyin",
+                daemon=True,
             )
-            db.add(session)
-            db.commit()
-            db.refresh(session)
-            self.session_id = session.id
-            logger.info("DB session id=%d 已创建", self.session_id)
+            self._ws_thread.start()
+            logger.info("WebSocket 线程已启动")
 
-        self.start_time = datetime.now()
+            # 4. 视频录制（主线程，阻塞）
+            if self.record_video:
+                try:
+                    self._start_recording()
+                except Exception as exc:
+                    logger.error("视频录制异常: %s", exc)
 
-        # 3. 启动 WebSocket（子线程）
-        self._stop_event.clear()
-        self._ws_thread = threading.Thread(
-            target=self._connect_ws,
-            name="ws-douyin",
-            daemon=True,
-        )
-        self._ws_thread.start()
-        logger.info("WebSocket 线程已启动")
-
-        # 4. 视频录制（主线程，阻塞）
-        if self.record_video:
-            try:
-                self._start_recording()
-            except Exception as exc:
-                logger.error("视频录制异常: %s", exc)
-
-        # 录制结束或未开启录制时等待 stop
-        self._stop_event.wait()
+            # 录制结束或未开启录制时等待 stop
+            self._stop_event.wait()
+            self.status = "stopped"
+        except Exception as exc:
+            self.status = "error"
+            self.error_message = str(exc)
+            logger.error("采集启动失败: %s", exc)
+            raise
 
     def is_running(self) -> bool:
         """返回采集器是否正在运行"""
-        return self._ws_thread is not None and self._ws_thread.is_alive()
+        return self.status in ("connecting", "running") and self._ws_thread is not None and self._ws_thread.is_alive()
+
+    def get_status(self) -> dict:
+        """返回采集器状态快照（供 API 调用）"""
+        return {
+            "status": self.status,
+            "error_message": self.error_message,
+            "ws_connected": self.ws_connected,
+            "events_received": self.events_received,
+            "session_id": self.session_id,
+            "room_id": self.room_id,
+            "live_id": self.live_id,
+            "anchor_name": self.anchor_name,
+        }
 
     def stop(self) -> None:
         """停止采集：关闭 WS、终止 ffmpeg、更新 DB。"""
@@ -274,25 +301,101 @@ class LiveCollector:
         return ""
 
     def _resolve_room_id(self) -> Tuple[str, str]:
-        """直接复用 douyin-live-toolkit 的 DouyinRoomResolver (已验证可用)。"""
-        sys.path.insert(0, "/home/opensource/douyin-live-toolkit/src")
-        from douyin_live_toolkit.room import DouyinRoomResolver
-        sys.path.pop(0)
+        """自实现房间 ID 解析：直接请求抖音直播页面提取 roomId，不依赖外部工具包。"""
+        url = f"https://live.douyin.com/{self.live_id}"
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Cookie": self.cookie_str,
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
 
-        resolver = DouyinRoomResolver(live_id=self.live_id)
-        room_id = resolver.room_id
-        if not room_id:
-            raise RuntimeError(f"未能解析 room_id，live_id={self.live_id}")
-
-        # 尝试获取标题
-        room_title = ""
         try:
-            info = resolver.fetch_room_info(max_attempts=2)
-            if info:
-                room_title = (info.get("room_title") or info.get("title") or "")[:100]
-        except Exception:
-            pass
+            resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+            resp.raise_for_status()
+            html = resp.text
+        except Exception as exc:
+            raise RuntimeError(f"请求抖音直播页面失败: {exc}")
 
+        room_id = ""
+        room_title = ""
+
+        # 方法1: 从 SSR 渲染的 JSON 数据中提取 roomId
+        # 页面中通常有 roomId 在 script 标签或内联 JSON 中
+        patterns_room = [
+            r'"roomId"\s*:\s*"(\d+)"',
+            r'"room_id"\s*:\s*"(\d+)"',
+            r'"id"\s*:\s*(\d+).*?"web_rid"',
+            r'web_rid=(\d+)',
+            r'"roomId"\s*:\s*(\d+)',
+        ]
+        for pat in patterns_room:
+            m = re.search(pat, html)
+            if m:
+                room_id = m.group(1)
+                break
+
+        # 方法2: 从 URL 重定向中提取
+        if not room_id:
+            final_url = resp.url
+            m = re.search(r'live\.douyin\.com/(\d+)', final_url)
+            if m:
+                room_id = m.group(1)
+
+        # 方法3: 从 RENDER_DATA 中提取（抖音 SSR 数据）
+        if not room_id:
+            m = re.search(r'<script\s+id="RENDER_DATA"[^>]*>([^<]+)</script>', html)
+            if m:
+                import urllib.parse
+                try:
+                    decoded = urllib.parse.unquote(m.group(1))
+                    rm = re.search(r'"roomId"\s*:\s*"(\d+)"', decoded)
+                    if rm:
+                        room_id = rm.group(1)
+                    else:
+                        rm = re.search(r'"roomId"\s*:\s*(\d+)', decoded)
+                        if rm:
+                            room_id = rm.group(1)
+                    # 也尝试提取标题
+                    tm = re.search(r'"roomTitle"\s*:\s*"([^"]+)"', decoded)
+                    if tm:
+                        room_title = tm.group(1)
+                    if not room_title:
+                        tm = re.search(r'"room_title"\s*:\s*"([^"]+)"', decoded)
+                        if tm:
+                            room_title = tm.group(1)
+                except Exception:
+                    pass
+
+        # 方法4: 调用抖音 web API
+        if not room_id:
+            try:
+                api_url = f"https://webcast.amemv.com/webcast/room/reflow/info/?live_id={self.live_id}&aid=1128"
+                api_resp = requests.get(api_url, headers=headers, timeout=10)
+                if api_resp.status_code == 200:
+                    data = api_resp.json()
+                    room_info = data.get("data", {}).get("room", {})
+                    room_id = str(room_info.get("id_str", "") or room_info.get("id", ""))
+                    if not room_title:
+                        room_title = room_info.get("title", "")
+            except Exception as exc:
+                logger.warning("web API 解析失败: %s", exc)
+
+        if not room_id:
+            raise RuntimeError(
+                f"未能解析 room_id（live_id={self.live_id}）。"
+                f"可能原因：直播间ID不正确、直播间未开播、或cookie已过期。"
+            )
+
+        # 如果还没拿到标题，尝试从 HTML title 标签提取
+        if not room_title:
+            m = re.search(r'<title>([^<]+)</title>', html)
+            if m:
+                title = m.group(1).strip()
+                if "抖音" not in title or "直播" in title:
+                    room_title = title[:100]
+
+        logger.info("自实现解析完成: room_id=%s, title=%s", room_id, room_title)
         return room_id, room_title
 
     def _generate_ws_signature(self, wss_url: str) -> str:
@@ -385,6 +488,8 @@ class LiveCollector:
 
         def on_open(ws):
             logger.info("WebSocket 已连接")
+            self.ws_connected = True
+            self.status = "running"
             threading.Thread(
                 target=self._heartbeat_loop,
                 args=(ws,),
@@ -403,6 +508,7 @@ class LiveCollector:
 
         def on_close(ws, close_status_code, close_msg):
             logger.info("WebSocket 关闭: code=%s msg=%s", close_status_code, close_msg)
+            self.ws_connected = False
 
         # ---------- 连接 ----------
         try:
@@ -618,6 +724,7 @@ class LiveCollector:
                 )
                 db.add(event)
                 db.commit()
+                self.events_received += 1
         except Exception as exc:
             logger.error("写入 live_events 失败: method=%s error=%s", method, exc)
 

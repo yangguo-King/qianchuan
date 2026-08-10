@@ -62,6 +62,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .auth-box input{font-size:13px;padding:6px 10px;border:1px solid #d1d5db;border-radius:6px;flex:1}
 .hidden{display:none}
 .empty{text-align:center;color:#94a3b8;padding:40px 20px;font-size:14px}
+.error-bar{background:#fef2f2;border:1px solid #fecaca;color:#dc2626;padding:10px 20px;font-size:13px;border-radius:8px;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.error-bar strong{font-weight:600}
+.status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:4px}
+.status-dot.running{background:#16a34a}
+.status-dot.error{background:#dc2626}
+.status-dot.connecting{background:#f59e0b}
+.status-dot.idle{background:#94a3b8}
 #recordingStatus{font-size:11px;padding:2px 8px;border-radius:10px;margin-left:8px}
 .rec-on{background:#dcfce7;color:#166534}
 
@@ -104,6 +111,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 
 <!-- LIVE TAB -->
 <div id=tabLive>
+  <div id=errorBar class="error-bar hidden"></div>
+  <div style="margin-bottom:12px;font-size:12px;color:#64748b">
+    采集状态：<span id=collectStatusDot class="status-dot idle"></span><span id=collectStatusText>未启动</span>
+    <span id=collectEventsInfo style="margin-left:12px"></span>
+  </div>
   <div class=grid4>
     <div class=card><h3>弹幕数</h3><div class=val id=chat>-</div></div>
     <div class=card><h3>进场人数</h3><div class=val id=member>-</div></div>
@@ -239,14 +251,15 @@ async function start(){
   var liveId=$('liveId').value.trim();
   if(!liveId){alert('选或输入直播间ID');return}
   try{
-    var d=await (await fetch('/api/collect/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({live_id:liveId,anchor_name:$('anchor').value||liveId})})).json();
-    if(d.ok){
+    var resp=await fetch('/api/collect/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({live_id:liveId,anchor_name:$('anchor').value||liveId})});
+    var d=await resp.json();
+    if(resp.ok&&d.ok){
       $('startBtn').disabled=true;$('stopBtn').disabled=false;$('recordingStatus').textContent='采集中';$('recordingStatus').className='rec-on';
       running=true;update();if(!timer)timer=setInterval(update,5000);
       fetch('/api/recording/start?live_id='+encodeURIComponent(liveId),{method:'POST'}).catch(function(){});
       fetch('/api/asr/start',{method:'POST'}).catch(function(){});
       $('recBtn').style.background='#16a34a';$('recBtn').textContent='录屏中';
-    }else{alert(d.detail||'失败')}
+    }else{alert(d.detail||d.message||'启动失败')}
   }catch(e){alert(e.message)}
 }
 
@@ -277,6 +290,29 @@ async function update(){
   // 隐藏标签页不轮询, 减少后台资源占用
   if(document.hidden)return;
   try{
+    // 先检查采集器状态
+    var cs=await(await fetch('/api/collect/status')).json();
+    // 更新采集状态指示器
+    var dot=$('collectStatusDot'),txt=$('collectStatusText'),info=$('collectEventsInfo'),bar=$('errorBar');
+    dot.className='status-dot '+(cs.status==='running'?'running':cs.status==='error'?'error':cs.status==='connecting'?'connecting':'idle');
+    var statusMap={idle:'未启动',init:'初始化中',connecting:'连接中...',running:'采集中',error:'采集异常',stopped:'已停止'};
+    txt.textContent=statusMap[cs.status]||cs.status;
+    info.textContent=cs.events_received>0?'已接收 '+cs.events_received+' 条事件':'';
+
+    // 显示/隐藏错误条
+    if(cs.status==='error'&&cs.error_message){
+      bar.classList.remove('hidden');
+      bar.innerHTML='<strong>采集异常：</strong>'+e(cs.error_message);
+    }else if(cs.status==='running'&&!cs.ws_connected){
+      bar.classList.remove('hidden');
+      bar.innerHTML='<strong>WebSocket 未连接</strong>，正在尝试重连...';
+    }else{
+      bar.classList.add('hidden');
+    }
+
+    // 如果采集器异常，不继续轮询场次数据
+    if(cs.status==='error'||cs.status==='idle'){return}
+
     var s=await(await fetch('/api/session/current')).json();
     if(s.id){
       sessionId=s.id;

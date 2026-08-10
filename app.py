@@ -10,6 +10,9 @@ from sqlalchemy import desc, func, select
 
 from models import init_db, get_session, Session, LiveEvent, Transcript, Review, Account, Setting as SettingModel, ENGINE
 
+DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 logger = logging.getLogger("app")
 
 # 全局当前采集器
@@ -68,9 +71,15 @@ async def start_collect(req: StartReq):
     with _collector_lock:
         if _current_collector and _current_collector.is_running():
             raise HTTPException(400, "已有采集在运行")
+
+        # cookie 文件不存在时给出明确提示
+        cookie_path = req.cookie_file or Config.COOKIE_FILE
+        if not os.path.exists(cookie_path):
+            raise HTTPException(400, f"Cookie 文件不存在: {cookie_path}，请先在系统设置中配置")
+
         collector = LiveCollector(
             live_id=req.live_id,
-            cookie_file=req.cookie_file or Config.COOKIE_FILE,
+            cookie_file=cookie_path,
             anchor_name=req.anchor_name,
             record_video=req.record_video
         )
@@ -85,6 +94,14 @@ async def start_collect(req: StartReq):
 
     threading.Thread(target=_run, daemon=True).start()
     return {"ok": True, "message": "采集启动中, 请等待数据出现"}
+
+@app.get("/api/collect/status")
+def collect_status():
+    """返回采集器实时状态（供前端轮询）"""
+    global _current_collector
+    if _current_collector is None:
+        return {"status": "idle", "error_message": "", "ws_connected": False, "events_received": 0}
+    return _current_collector.get_status()
 
 @app.post("/api/collect/stop")
 def stop_collect():
@@ -113,12 +130,14 @@ RECORDER_CONFIG = Config.RECORDER_CONFIG
 
 @app.post("/api/recording/start")
 def recording_start(live_id: str = ""):
-    """启动 DouyinLiveRecorder 录屏"""
+    """启动 DouyinLiveRecorder 录屏（仅 Windows 可用，非 Windows 静默跳过）"""
     import subprocess
     if not live_id:
         raise HTTPException(400, "需要提供 live_id")
     if not os.path.exists(RECORDER_EXE):
-        raise HTTPException(500, f"录屏工具不存在: {RECORDER_EXE}")
+        # 非 Windows 环境或 DouyinLiveRecorder 未安装，静默返回（collector 自带 ffmpeg 录制）
+        logger.info("DouyinLiveRecorder 不可用 (%s)，使用 collector 自带 ffmpeg 录制", RECORDER_EXE)
+        return {"ok": True, "note": "DouyinLiveRecorder 不可用，已使用 ffmpeg 替代录制"}
     # 杀旧进程
     try:
         subprocess.run(["taskkill", "/F", "/IM", "DouyinLiveRecorder.exe"],
@@ -144,14 +163,15 @@ def recording_start(live_id: str = ""):
 
 @app.post("/api/recording/stop")
 def recording_stop():
-    """停止 DouyinLiveRecorder 录屏"""
+    """停止 DouyinLiveRecorder 录屏（不可用时静默跳过）"""
     import subprocess
     try:
         subprocess.run(["taskkill", "/F", "/IM", "DouyinLiveRecorder.exe"],
                        capture_output=True, timeout=10)
         return {"ok": True}
     except Exception as e:
-        raise HTTPException(500, f"停止失败: {e}")
+        logger.debug("DouyinLiveRecorder 停止跳过: %s", e)
+        return {"ok": True, "note": "DouyinLiveRecorder 未运行"}
 
 @app.get("/api/recording/stream-url")
 def recording_stream_url():
@@ -199,18 +219,24 @@ _asr_last_file = ""
 def _asr_watch_loop():
     """后台线程: 监控录屏目录, 检测新 .mp4 文件 → 自动送千问 ASR"""
     global _asr_watcher_running, _asr_last_file
-    WATCH_DIR = Config.VIDEO_DIR
-    logger.info("ASR watcher started, watching: %s", WATCH_DIR)
+    # 同时监听两个目录: collector 的 ffmpeg 输出 + Windows DouyinLiveRecorder 输出
+    watch_dirs = [str(DATA_DIR / "videos")]
+    if Config.VIDEO_DIR and os.path.isdir(Config.VIDEO_DIR):
+        watch_dirs.append(Config.VIDEO_DIR)
+    logger.info("ASR watcher started, watching: %s", watch_dirs)
 
     while _asr_watcher_running:
         try:
             today = datetime.datetime.now().strftime("%Y-%m-%d")
             files = []
-            for root, dirs, filenames in os.walk(WATCH_DIR):
-                for f in filenames:
-                    if f.endswith('.mp4') and today in f:
-                        fp = os.path.join(root, f)
-                        files.append((fp, os.path.getmtime(fp), os.path.getsize(fp)))
+            for watch_dir in watch_dirs:
+                if not os.path.isdir(watch_dir):
+                    continue
+                for root, dirs, filenames in os.walk(watch_dir):
+                    for f in filenames:
+                        if f.endswith('.mp4') and today in f:
+                            fp = os.path.join(root, f)
+                            files.append((fp, os.path.getmtime(fp), os.path.getsize(fp)))
             files.sort(key=lambda x: x[1])
 
             # 找上次处理之后的第一个新文件
@@ -230,19 +256,44 @@ def _run_asr_on_file(mp4_path: str):
 
     api_key = _get_setting("dashscope_api_key")
     if not api_key:
-        logger.warning("AI 分析跳过: 请在设置页配置 DashScope API Key")
+        logger.warning("AI 分析跳过: 请先在系统设置页配置 DashScope API Key")
+        return
+
+    # 检查 ffmpeg 是否可用
+    try:
+        sp.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
+    except (FileNotFoundError, sp.TimeoutExpired):
+        logger.error("ffmpeg 未安装或不在 PATH 中，无法进行 ASR/VL 分析")
         return
 
     name_hash = hashlib.md5(mp4_path.encode()).hexdigest()[:8]
     audio_path = f"/tmp/lr_asr_{name_hash}.wav"
-    frame_path = f"/tmp/lr_vl_{name_hash}.jpg"
+    frame_paths = [f"/tmp/lr_vl_{name_hash}_{i}.jpg" for i in range(3)]
     vision_result = ""
 
-    # ffmpeg: 抽音频 + 抽一帧(视频中点)
+    # ffmpeg: 抽音频 + 抽3帧(开头/中间/结尾)用于视觉分析
+    try:
+        # 获取视频时长
+        probe = sp.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", mp4_path],
+            capture_output=True, text=True, timeout=30
+        )
+        duration = float(probe.stdout.strip()) if probe.stdout.strip() else 60.0
+    except Exception:
+        duration = 60.0
+
+    # 抽音频
     sp.run(["ffmpeg", "-y", "-i", mp4_path,
-            "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", audio_path,
-            "-vframes", "1", "-q:v", "2", frame_path],
+            "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", audio_path],
            capture_output=True, timeout=120)
+
+    # 抽3帧：10%、50%、90% 位置
+    for i, pct in enumerate([0.1, 0.5, 0.9]):
+        ts = max(0, duration * pct)
+        sp.run(["ffmpeg", "-y", "-i", mp4_path,
+                "-ss", str(ts), "-vframes", "1", "-q:v", "2", frame_paths[i]],
+               capture_output=True, timeout=30)
 
     # ASR
     text = ""
@@ -257,39 +308,52 @@ def _run_asr_on_file(mp4_path: str):
             if not sentences:
                 sentences = [{"text": resp.output.get("text", ""), "begin_time": 0, "end_time": 0}]
             text = " ".join([s.get("text", "") for s in sentences])
+            logger.info("ASR done: %d chars from %s", len(text), os.path.basename(mp4_path))
         except Exception as e:
             logger.error("ASR failed: %s", e)
         finally:
             try: os.remove(audio_path)
             except Exception: pass
 
-    # VL 视觉分析: 抽一帧送给千问多模态模型
-    if os.path.exists(frame_path):
+    # VL 视觉分析: 送3帧给千问多模态模型，聚焦主播状态
+    existing_frames = [fp for fp in frame_paths if os.path.exists(fp)]
+    if existing_frames:
         try:
             import dashscope, base64
             dashscope.api_key = api_key
-            prompt = _get_setting("prompt_vision") or "请描述这张直播截图中的内容：画面信息、产品展示、主播状态。"
-            with open(frame_path, "rb") as f:
-                img_b64 = base64.b64encode(f.read()).decode()
+            prompt = _get_setting("prompt_vision") or (
+                "你是一位专业直播分析师。请分析这些直播截图，重点关注：\n"
+                "1. 主播状态：表情、肢体语言、语速感、精力状态、是否热情\n"
+                "2. 产品展示：是否有产品出镜、展示方式、摆放位置\n"
+                "3. 画面质量：灯光、背景、构图\n"
+                "4. 互动情况：是否有弹幕互动区域、观众参与度\n"
+                "请给出简洁的状态评估和改进建议。"
+            )
+
+            # 构建多图消息
+            content_parts = []
+            for fp in existing_frames:
+                with open(fp, "rb") as f:
+                    img_b64 = base64.b64encode(f.read()).decode()
+                content_parts.append({"image": f"data:image/jpeg;base64,{img_b64}"})
+            content_parts.append({"text": prompt})
 
             resp_vl = dashscope.MultiModalConversation.call(
                 model="qwen-vl-plus",
                 messages=[{
                     "role": "user",
-                    "content": [
-                        {"image": f"data:image/jpeg;base64,{img_b64}"},
-                        {"text": prompt}
-                    ]
+                    "content": content_parts
                 }]
             )
             if resp_vl.status_code == 200:
                 vision_result = resp_vl.output.choices[0].message.content[0].get("text", "")
-                logger.info("VL done: %d chars from %s", len(vision_result), os.path.basename(mp4_path))
+                logger.info("VL done: %d chars from %s (%d frames)", len(vision_result), os.path.basename(mp4_path), len(existing_frames))
         except Exception as e:
             logger.warning("VL failed (non-critical): %s", e)
         finally:
-            try: os.remove(frame_path)
-            except Exception: pass
+            for fp in existing_frames:
+                try: os.remove(fp)
+                except Exception: pass
 
     if not text and not vision_result:
         return
@@ -336,44 +400,99 @@ def stop_asr_watcher():
 # --- 场次数据 ---
 @app.get("/api/recording/status")
 def recording_status():
-    """检查 Windows DouyinLiveRecorder 录屏状态"""
+    """检查录屏状态（优先检查 DouyinLiveRecorder，其次检查 collector 的 ffmpeg 输出）"""
     import subprocess
     result = {"running": False, "latest_file": "", "total_files": 0, "total_mb": 0}
     try:
-        # 检查进程
-        proc = subprocess.run(
-            ["powershell.exe", "-Command",
-             "(Get-Process -Name 'DouyinLiveRecorder' -ErrorAction SilentlyContinue | Measure-Object).Count"],
-            capture_output=True, text=True, timeout=10
-        )
-        result["running"] = proc.stdout.strip() != "0"
+        # 检查 DouyinLiveRecorder 进程（仅 Windows）
+        try:
+            proc = subprocess.run(
+                ["powershell.exe", "-Command",
+                 "(Get-Process -Name 'DouyinLiveRecorder' -ErrorAction SilentlyContinue | Measure-Object).Count"],
+                capture_output=True, text=True, timeout=5
+            )
+            result["running"] = proc.stdout.strip() != "0"
+        except (FileNotFoundError, Exception):
+            # 非 Windows 或 powershell 不可用，检查 collector 的 ffmpeg 进程
+            pass
 
-        # 检查今天录屏文件
-        import glob, datetime
-        today = datetime.datetime.now().strftime("%Y-%m-%d")
-        base = Config.VIDEO_DIR
-        files = []
-        for root, dirs, filenames in os.walk(base):
-            for f in filenames:
-                if f.endswith(('.ts', '.mp4')) and today in f:
-                    fp = os.path.join(root, f)
-                    files.append((fp, os.path.getsize(fp), os.path.getmtime(fp)))
-        files.sort(key=lambda x: x[2], reverse=True)
-        if files:
-            latest = files[0]
-            result["latest_file"] = os.path.basename(latest[0])
-            result["latest_mb"] = round(latest[1] / 1048576, 1)
-            result["latest_time"] = datetime.datetime.fromtimestamp(latest[2]).strftime("%H:%M:%S")
-            total_size = sum(f[1] for f in files)
-            result["total_files"] = len(files)
-            result["total_mb"] = round(total_size / 1048576, 1)
+        # 检查 collector 的 ffmpeg 录制输出（data/videos/）
+        collector_video_dir = str(DATA_DIR / "videos")
+        if os.path.isdir(collector_video_dir):
+            import datetime as _dt
+            today = _dt.datetime.now().strftime("%Y-%m-%d")
+            files = []
+            for root, dirs, filenames in os.walk(collector_video_dir):
+                for f in filenames:
+                    if f.endswith(('.ts', '.mp4')):
+                        fp = os.path.join(root, f)
+                        files.append((fp, os.path.getsize(fp), os.path.getmtime(fp)))
+            files.sort(key=lambda x: x[2], reverse=True)
+            if files:
+                latest = files[0]
+                result["latest_file"] = os.path.basename(latest[0])
+                result["latest_mb"] = round(latest[1] / 1048576, 1)
+                result["latest_time"] = _dt.datetime.fromtimestamp(latest[2]).strftime("%H:%M:%S")
+                total_size = sum(f[1] for f in files)
+                result["total_files"] = len(files)
+                result["total_mb"] = round(total_size / 1048576, 1)
+                # 如果有 ffmpeg 输出，认为录制在进行
+                if not result["running"]:
+                    result["running"] = True
+                    result["source"] = "ffmpeg"
+
+        # 也检查 Windows 录屏目录
+        try:
+            import datetime as _dt
+            today = _dt.datetime.now().strftime("%Y-%m-%d")
+            base = Config.VIDEO_DIR
+            if os.path.isdir(base):
+                win_files = []
+                for root, dirs, filenames in os.walk(base):
+                    for f in filenames:
+                        if f.endswith(('.ts', '.mp4')) and today in f:
+                            fp = os.path.join(root, f)
+                            win_files.append((fp, os.path.getsize(fp), os.path.getmtime(fp)))
+                if win_files and not result["latest_file"]:
+                    latest = max(win_files, key=lambda x: x[2])
+                    result["latest_file"] = os.path.basename(latest[0])
+                    result["latest_mb"] = round(latest[1] / 1048576, 1)
+                    result["latest_time"] = _dt.datetime.fromtimestamp(latest[2]).strftime("%H:%M:%S")
+                    result["total_files"] = len(win_files)
+                    result["total_mb"] = round(sum(f[1] for f in win_files) / 1048576, 1)
+                    result["source"] = "DouyinLiveRecorder"
+        except Exception:
+            pass
+
     except Exception as e:
         result["error"] = str(e)
     return result
 
 @app.get("/api/sessions")
 def list_sessions(limit: int = 30):
-    """从 douyin-live-toolkit DB 读取真实采集历史"""
+    """读取采集历史。优先从本地 DB 读取，备选从 douyin-live-toolkit DB 读取。"""
+    # 优先从本地 SQLite 读取
+    with get_session() as db:
+        local_sessions = db.query(Session).order_by(desc(Session.started_at)).limit(limit).all()
+        if local_sessions:
+            result = []
+            for s in local_sessions:
+                chat_count = db.query(LiveEvent).filter(LiveEvent.session_id == s.id, LiveEvent.event_type == "chat").count()
+                member_count = db.query(LiveEvent).filter(LiveEvent.session_id == s.id, LiveEvent.event_type == "member").count()
+                peak_online = db.query(func.max(LiveEvent.content)).filter(
+                    LiveEvent.session_id == s.id, LiveEvent.event_type == "room_stat"
+                ).scalar() or 0
+                result.append({
+                    "id": s.id, "live_id": s.live_id, "room_title": s.room_title or "",
+                    "anchor_name": s.anchor_name or "",
+                    "started_at": str(s.started_at) if s.started_at else "",
+                    "ended_at": str(s.ended_at) if s.ended_at else None,
+                    "chat_count": chat_count, "member_count": member_count,
+                    "peak_online": peak_online if isinstance(peak_online, int) else 0,
+                })
+            return result
+
+    # 备选：从 douyin-live-toolkit DB 读取
     import sqlite3
     dlt_db = Config.DLT_DB
     result = []
@@ -671,9 +790,16 @@ def sync_accounts_internal(access_token: str):
 
 SETTING_DEFAULTS = {
     "dashscope_api_key": "",
-    "prompt_transcript": "请分析以下直播内容，关注：话术特点、产品介绍、互动情况、转化技巧。",
-    "prompt_vision": "请描述这张直播截图中的内容：画面信息、产品展示、主播状态。",
-    "prompt_summary": "请作为直播电商复盘分析师，分析以下数据生成结构化报告。",
+    "prompt_transcript": "请分析以下直播话术内容，关注：话术特点、产品介绍方式、互动技巧、转化话术、节奏把控。",
+    "prompt_vision": (
+        "你是一位专业直播分析师。请分析这些直播截图，重点关注：\n"
+        "1. 主播状态：表情、肢体语言、语速感、精力状态、是否热情\n"
+        "2. 产品展示：是否有产品出镜、展示方式、摆放位置\n"
+        "3. 画面质量：灯光、背景、构图\n"
+        "4. 互动情况：是否有弹幕互动区域、观众参与度\n"
+        "请给出简洁的状态评估和改进建议。"
+    ),
+    "prompt_summary": "请作为直播电商复盘分析师，分析以下数据生成结构化报告，包含：整体表现评估、话术分析、投流效果、改进建议。",
 }
 
 # 内存缓存，避免每次 AI 调用都查 DB

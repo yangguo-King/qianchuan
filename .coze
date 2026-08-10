@@ -1,0 +1,16 @@
+[project]
+sub_id = "48bf17f4"
+name = "live-replay"
+requires = ["python-3.12"]
+project_type = "backend"
+version = "0.0.32"
+
+[preview]
+preview_enable = "disabled"
+
+[deploy]
+build = ["bash", "-c", "pip install -r requirements.txt 2>/dev/null || true"]
+run = ["python", "app.py"]
+
+[subprojects]
+path = ["."]
