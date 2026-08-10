@@ -77,11 +77,18 @@ async def start_collect(req: StartReq):
         if not os.path.exists(cookie_path):
             raise HTTPException(400, f"Cookie 文件不存在: {cookie_path}，请先在系统设置中配置")
 
+        # 读取 cookie 文件内容
+        with open(cookie_path, 'r', encoding='utf-8') as f:
+            cookie_content = f.read().strip()
+
+        # 生成 session_id
+        session_id = str(uuid.uuid4())
+
         collector = LiveCollector(
             live_id=req.live_id,
-            cookie_file=cookie_path,
             anchor_name=req.anchor_name,
-            record_video=req.record_video
+            session_id=session_id,
+            cookie=cookie_content,
         )
         _current_collector = collector
 
