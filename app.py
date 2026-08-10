@@ -1,7 +1,7 @@
 """Live-Replay FastAPI Backend
 端口: 9999, 提供监控面板 API + 静态前端
 """
-import os, sys, json, threading, datetime, urllib.parse, logging, time
+import os, sys, json, threading, datetime, urllib.parse, logging, time, uuid
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
