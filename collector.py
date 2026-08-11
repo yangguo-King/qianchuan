@@ -327,8 +327,12 @@ class LiveCollector:
         try:
             from vendor.douyin_pb import PushFrame, Response, ChatMessage, MemberMessage, GiftMessage, LikeMessage
 
+            # 先打印原始数据的前几个字节，用于调试
+            logger.info(f"[{self.session_id}] 原始帧 {len(data)} bytes, 前20字节: {data[:20].hex()}")
+
             # 解析 PushFrame
             frame = PushFrame().parse(data)
+            logger.info(f"[{self.session_id}] PushFrame 解析完成: payload={len(frame.payload)} bytes, encoding={frame.payload_encoding}, log_id={frame.log_id}")
 
             # 解压 payload（encoding 可能缺失，自动检测 gzip 头）
             if frame.payload_encoding == b"gzip":
