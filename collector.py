@@ -271,7 +271,12 @@ class LiveCollector:
         """连接抖音 WebSocket 服务器"""
         self.status = "connecting"
         
-        # 构建 WebSocket URL
+        # 生成动态时间戳和设备 ID
+        now_ms = int(time.time() * 1000)
+        # 使用 ttwid 的哈希作为设备 ID
+        did = hashlib.md5(self._ttwid.encode()).hexdigest()[:19]
+        
+        # 构建 WebSocket URL（使用动态值）
         wss = ("wss://webcast100-ws-web-lq.douyin.com/webcast/im/push/v2/?app_name=douyin_web"
                "&version_code=180800&webcast_sdk_version=1.0.14-beta.0"
                "&update_version_code=1.0.14-beta.0&compress=gzip&device_platform=web&cookie_enabled=true"
@@ -280,12 +285,12 @@ class LiveCollector:
                "&browser_version=5.0%20(Windows%20NT%2010.0;%20Win64;%20x64)%20AppleWebKit/537.36%20(KHTML,"
                "%20like%20Gecko)%20Chrome/126.0.0.0%20Safari/537.36"
                "&browser_online=true&tz_name=Asia/Shanghai"
-               "&cursor=d-1_u-1_fh-7392091211001140287_t-1721106114633_r-1"
-               f"&internal_ext=internal_src:dim|wss_push_room_id:{self._room_id}|wss_push_did:7319483754668557238"
-               f"|first_req_ms:1721106114541|fetch_time:1721106114633|seq:1|wss_info:0-1721106114633-0-0|"
+               f"&cursor=d-1_u-1_fh-7392091211001140287_t-{now_ms}_r-1"
+               f"&internal_ext=internal_src:dim|wss_push_room_id:{self._room_id}|wss_push_did:{did}"
+               f"|first_req_ms:{now_ms}|fetch_time:{now_ms}|seq:1|wss_info:0-{now_ms}-0-0|"
                f"wrds_v:7392094459690748497"
                f"&host=https://live.douyin.com&aid=6383&live_id=1&did_rule=3&endpoint=live_pc&support_wrds=1"
-               f"&user_unique_id=7319483754668557238&im_path=/webcast/im/fetch/&identity=audience"
+               f"&user_unique_id={did}&im_path=/webcast/im/fetch/&identity=audience"
                f"&need_persist_msg_count=15&insert_task_id=&live_reason=&room_id={self._room_id}&heartbeatDuration=0")
         
         # 生成签名
