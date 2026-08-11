@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+websocket-client
+py_mini_racer
+betterproto
+dashscope
+sqlalchemy
+pydantic
+python-dotenv
+requests
+protobuf
