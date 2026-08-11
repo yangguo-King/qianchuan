@@ -334,17 +334,38 @@ class LiveCollector:
             
             # 解析 protobuf
             package = PushFrame().parse(message)
-            response = Response().parse(gzip.decompress(package.payload))
+            logger.debug(f"[{self.session_id}] 帧信息: log_id={package.log_id}, payload_len={len(package.payload)}, encoding={package.payload_encoding}")
             
+            # 检查 payload 是否为空
+            if not package.payload:
+                logger.warning(f"[{self.session_id}] 帧 payload 为空，跳过")
+                return
+            
+            # 解压
+            try:
+                if package.payload_encoding == b'gzip':
+                    payload = gzip.decompress(package.payload)
+                else:
+                    payload = package.payload
+                logger.debug(f"[{self.session_id}] 解压后字节数: {len(payload)}")
+            except Exception as e:
+                logger.error(f"[{self.session_id}] 解压失败: {e}")
+                return
+            
+            if not payload:
+                logger.warning(f"[{self.session_id}] 解压后 payload 为空")
+                return
+            
+            response = Response().parse(payload)
             logger.debug(f"[{self.session_id}] 解析成功，消息数: {len(response.messages_list)}, need_ack: {response.need_ack}")
             
             # 发送 ACK
             if response.need_ack:
-                ack = PushFrame(
+                ack = bytes(PushFrame(
                     log_id=package.log_id,
                     payload_type='ack',
                     payload=response.internal_ext.encode('utf-8')
-                ).SerializeToString()
+                ))
                 ws.send(ack, websocket.ABNF.OPCODE_BINARY)
             
             # 处理消息列表
@@ -372,7 +393,7 @@ class LiveCollector:
         """发送心跳包"""
         while self._running and self._ws_connected:
             try:
-                heartbeat = PushFrame(payload_type='hb').SerializeToString()
+                heartbeat = bytes(PushFrame(payload_type='hb'))
                 self._ws.send(heartbeat, websocket.ABNF.OPCODE_PING)
             except Exception as e:
                 logger.error(f"[{self.session_id}] 心跳发送失败: {e}")
