@@ -294,10 +294,12 @@ class LiveCollector:
     async def _on_websocket(self, ws):
         """处理 WebSocket 连接"""
         url = ws.url
+        logger.info(f"[{self.session_id}] 检测到 WebSocket: {url[:100]}...")
         if "webcast/im/push" not in url and "im/fetch" not in url:
+            logger.debug(f"[{self.session_id}] 跳过非弹幕 WebSocket: {url[:50]}")
             return
 
-        logger.info(f"[{self.session_id}] 拦截到 WebSocket: {url[:80]}...")
+        logger.info(f"[{self.session_id}] ✅ 拦截到弹幕 WebSocket: {url[:80]}...")
         self.ws_connected = True
 
         def _on_frame(frame):
@@ -311,8 +313,10 @@ class LiveCollector:
             else:
                 payload = b""
             if isinstance(payload, bytes) and payload:
-                logger.info(f"[{self.session_id}] WS 帧 {len(payload)} bytes")
+                logger.info(f"[{self.session_id}] 📦 WS 帧 {len(payload)} bytes")
                 self._process_message(payload)
+            else:
+                logger.debug(f"[{self.session_id}] 空帧或无效帧: type={type(frame)}")
 
         ws.on("framereceived", _on_frame)
         ws.on("close", lambda: logger.info(f"[{self.session_id}] WS 连接关闭"))
