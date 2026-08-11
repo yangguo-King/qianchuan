@@ -264,9 +264,6 @@ class LiveCollector:
 
             self._page = await context.new_page()
 
-            # 监听 WebSocket 消息
-            self._page.on("websocket", self._on_websocket)
-
             # 访问直播间
             url = f"https://live.douyin.com/{self.live_id}"
             logger.info(f"[{self.session_id}] 访问直播间: {url}")
@@ -279,11 +276,63 @@ class LiveCollector:
                 await asyncio.sleep(5)
 
                 self.status = "running"
-                self.ws_connected = True
-                logger.info(f"[{self.session_id}] 采集已启动")
+                logger.info(f"[{self.session_id}] 采集已启动，开始 DOM 抓取弹幕")
 
-                # 保持运行
+                # DOM 抓取弹幕
+                seen_ids = set()
                 while self._running:
+                    try:
+                        # 查询弹幕元素
+                        danmakus = await self._page.evaluate("""
+                            () => {
+                                const results = [];
+                                // 抖音直播弹幕容器选择器
+                                const selectors = [
+                                    '[class*="ChatMessage"]',
+                                    '[class*="chat-message"]',
+                                    '[class*="webcast-chatroom"] [class*="item"]',
+                                    '[data-e2e="chat-message"]',
+                                    '.chat-item',
+                                ];
+                                
+                                for (const selector of selectors) {
+                                    const elements = document.querySelectorAll(selector);
+                                    elements.forEach((el, idx) => {
+                                        const text = el.innerText || el.textContent || '';
+                                        if (text.trim()) {
+                                            // 生成唯一 ID
+                                            const id = text.trim() + '_' + idx;
+                                            results.push({
+                                                id: id,
+                                                text: text.trim(),
+                                                html: el.innerHTML.substring(0, 200),
+                                            });
+                                        }
+                                    });
+                                    if (results.length > 0) break;
+                                }
+                                
+                                return results;
+                            }
+                        """)
+                        
+                        if danmakus:
+                            logger.debug(f"[{self.session_id}] DOM 抓取到 {len(danmakus)} 条弹幕")
+                            for d in danmakus:
+                                if d['id'] not in seen_ids:
+                                    seen_ids.add(d['id'])
+                                    # 存储弹幕
+                                    self._store_chat(d['text'], '', '')
+                                    self.events_received += 1
+                                    logger.info(f"[{self.session_id}] 弹幕: {d['text'][:50]}")
+                        
+                        # 限制 seen_ids 大小
+                        if len(seen_ids) > 1000:
+                            seen_ids.clear()
+                            
+                    except Exception as e:
+                        logger.debug(f"[{self.session_id}] DOM 查询异常: {e}")
+                    
                     await asyncio.sleep(1)
 
             except Exception as e:
@@ -291,193 +340,25 @@ class LiveCollector:
                 self.error_message = f"页面加载失败: {e}"
                 logger.exception(f"[{self.session_id}] 页面加载失败")
 
-    async def _on_websocket(self, ws):
-        """处理 WebSocket 连接"""
-        url = ws.url
-        logger.info(f"[{self.session_id}] 检测到 WebSocket: {url[:100]}...")
-        if "webcast/im/push" not in url and "im/fetch" not in url:
-            logger.debug(f"[{self.session_id}] 跳过非弹幕 WebSocket: {url[:50]}")
-            return
-
-        logger.info(f"[{self.session_id}] ✅ 拦截到弹幕 WebSocket: {url[:80]}...")
-        self.ws_connected = True
-        self._ws = ws  # 保存 WebSocket 引用用于发送 ACK
-
-        def _on_frame(frame):
-            # CDP 模式直接传 bytes；pipe 模式传 WebSocketFrame 对象
-            if isinstance(frame, bytes):
-                payload = frame
-            elif hasattr(frame, "payload"):
-                payload = frame.payload
-            elif isinstance(frame, dict):
-                payload = frame.get("payload", b"")
-            else:
-                payload = b""
-            if isinstance(payload, bytes) and payload:
-                logger.info(f"[{self.session_id}] 📦 WS 帧 {len(payload)} bytes")
-                self._process_message(payload)
-                # 发送 ACK 确认收到
-                self._send_ack(payload)
-            else:
-                logger.debug(f"[{self.session_id}] 空帧或无效帧: type={type(frame)}")
-
-        ws.on("framereceived", _on_frame)
-        ws.on("close", lambda: logger.info(f"[{self.session_id}] WS 连接关闭"))
-        ws.on("error", lambda err: logger.info(f"[{self.session_id}] WS 错误: {err}"))
-
-    def _process_message(self, data: bytes):
-        """处理 WebSocket 消息"""
+    def _store_chat(self, content: str, user_id: str, nickname: str):
+        """存储弹幕到数据库"""
         try:
-            from vendor.douyin_pb import PushFrame, Response, ChatMessage, MemberMessage, GiftMessage, LikeMessage
-
-            # 先打印原始数据的前几个字节，用于调试
-            logger.info(f"[{self.session_id}] 原始帧 {len(data)} bytes, 前20字节: {data[:20].hex()}")
-
-            # 解析 PushFrame
-            frame = PushFrame().parse(data)
-            logger.info(f"[{self.session_id}] PushFrame 解析完成: payload={len(frame.payload)} bytes, encoding={frame.payload_encoding}, log_id={frame.log_id}")
-
-            # 解压 payload（encoding 可能缺失，自动检测 gzip 头）
-            if frame.payload_encoding == b"gzip":
-                payload = gzip.decompress(frame.payload)
-            elif frame.payload[:2] == b"\x1f\x8b":
-                # 自动检测 gzip 魔法头
-                payload = gzip.decompress(frame.payload)
-            else:
-                payload = frame.payload
-
-            logger.info(f"[{self.session_id}] 解压后 {len(payload)} bytes, encoding={frame.payload_encoding}")
-
-            if not payload:
-                return
-
-            # 解析 Response
-            try:
-                response = Response().parse(payload)
-            except Exception as e:
-                logger.warning(f"[{self.session_id}] Response 解析失败 ({type(e).__name__}), payload:{payload[:20].hex()}")
-                return
-
-            # 处理消息
-            msg_count = len(response.messages_list)
-            if msg_count > 0:
-                logger.info(f"[{self.session_id}] 解析到 {msg_count} 条消息")
-            for msg in response.messages_list:
-                method = msg.method
-                payload_data = msg.payload
-
-                try:
-                    if method == "WebcastChatMessage":
-                        chat = ChatMessage().parse(payload_data)
-                        self._handle_chat(chat)
-                    elif method == "WebcastMemberMessage":
-                        member = MemberMessage().parse(payload_data)
-                        self._handle_member(member)
-                    elif method == "WebcastGiftMessage":
-                        gift = GiftMessage().parse(payload_data)
-                        self._handle_gift(gift)
-                    elif method == "WebcastLikeMessage":
-                        like = LikeMessage().parse(payload_data)
-                        self._handle_like(like)
-                except Exception as e:
-                    logger.debug(f"[{self.session_id}] 解析 {method} 失败: {e}")
-
-        except Exception as e:
-            logger.warning(f"[{self.session_id}] 消息解析失败: {type(e).__name__}: {e}")
-
-    def _handle_chat(self, msg):
-        """处理弹幕消息"""
-        try:
-            user = msg.user
             event = LiveEvent(
                 session_id=self.session_id,
                 event_type="chat",
-                user_id=str(user.id),
-                nickname=user.nickname,
-                content=msg.content,
+                user_id=user_id or "unknown",
+                nickname=nickname or "unknown",
+                content=content,
                 raw_data="",
             )
-            self._save_event(event)
-            logger.debug(f"[{self.session_id}] 弹幕: {user.nickname}: {msg.content}")
+            db = get_session()
+            try:
+                db.add(event)
+                db.commit()
+            finally:
+                db.close()
         except Exception as e:
             logger.debug(f"[{self.session_id}] 保存弹幕失败: {e}")
-
-    def _handle_member(self, msg):
-        """处理进场消息"""
-        try:
-            user = msg.user
-            event = LiveEvent(
-                session_id=self.session_id,
-                event_type="member",
-                user_id=str(user.id),
-                nickname=user.nickname,
-                content="进入直播间",
-                raw_data="",
-            )
-            self._save_event(event)
-            logger.debug(f"[{self.session_id}] 进场: {user.nickname}")
-        except Exception as e:
-            logger.debug(f"[{self.session_id}] 保存进场消息失败: {e}")
-
-    def _handle_gift(self, msg):
-        """处理礼物消息"""
-        try:
-            user = msg.user
-            event = LiveEvent(
-                session_id=self.session_id,
-                event_type="gift",
-                user_id=str(user.id),
-                nickname=user.nickname,
-                content=f"{msg.gift.name} x{msg.combo_count or 1}",
-                raw_data="",
-            )
-            self._save_event(event)
-            logger.debug(f"[{self.session_id}] 礼物: {user.nickname} 送出 {msg.gift.name}")
-        except Exception as e:
-            logger.debug(f"[{self.session_id}] 保存礼物消息失败: {e}")
-
-    def _handle_like(self, msg):
-        """处理点赞消息"""
-        try:
-            user = msg.user
-            event = LiveEvent(
-                session_id=self.session_id,
-                event_type="like",
-                user_id=str(user.id),
-                nickname=user.nickname,
-                content=f"点赞 x{msg.count}",
-                raw_data="",
-            )
-            self._save_event(event)
-        except Exception as e:
-            logger.debug(f"[{self.session_id}] 保存点赞消息失败: {e}")
-
-    def _save_event(self, event: LiveEvent):
-        """保存事件到数据库"""
-        db = get_session()
-        try:
-            db.add(event)
-            db.commit()
-            self.events_received += 1
-        except Exception as e:
-            logger.error(f"[{self.session_id}] 保存事件失败: {e}")
-            db.rollback()
-        finally:
-            db.close()
-
-    def _send_ack(self, frame_data: bytes):
-        """发送 ACK 确认消息"""
-        if not hasattr(self, '_ws') or self._ws is None:
-            return
-        try:
-            # 解析收到的帧获取 log_id
-            frame = douyin_pb2.PushFrame()
-            frame.ParseFromString(frame_data)
-
-            # 构造 ACK 响应
-            ack = douyin_pb2.PushFrame()
-            ack.payload_type = "ack"
-            ack.log_id = frame.log_id
 
             # 发送 ACK
             self._ws.send(ack.SerializeToString())
@@ -524,11 +405,11 @@ class LiveCollector:
             match = re.search(r"live\.douyin\.com/(\d+)", resp.url)
             if match:
                 return match.group(1)
-        except Exception:
-            pass
 
-        # 兜底: 抖音页面现在全 React 渲染，HTTP 请求拿不到 roomId
-        # 直接用 live_id，实际 WebSocket 拦截不依赖 room_id
+
+        except Exception as e:
+            logger.warning(f"[{self.session_id}] HTTP 提取 roomId 失败: {e}")
+
         logger.warning(f"[{self.session_id}] HTTP 无法提取 roomId，使用 live_id={live_id} 兜底")
         return live_id
 
