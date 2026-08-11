@@ -1,46 +1,31 @@
+# -*- coding: utf-8 -*-
 """
-抖音直播弹幕采集器 - Playwright 浏览器自动化方案
+抖音直播弹幕采集器 - JavaScript Hook 方案
 
-原理：
-1. 使用 Playwright 启动真实浏览器访问抖音直播间
-2. 浏览器自动处理所有签名和认证
-3. 拦截 WebSocket 消息获取弹幕数据
-4. 使用 protobuf 解析消息
-
-优势：
-- 不依赖签名算法，更稳定
-- 和真人用户一样访问页面
-- 维护成本低
+通过注入 JavaScript 代码 hook WebSocket，在浏览器内部捕获弹幕数据。
+这比 DOM 抓取更可靠，因为我们可以直接获取 WebSocket 消息。
 """
 
 import asyncio
-import gzip
 import hashlib
 import logging
 import re
-import threading
 import time
-from datetime import datetime
-from typing import Optional, Callable, Dict, Any
+import uuid
+from typing import Optional
 
-import requests
+from playwright.async_api import async_playwright, Page, BrowserContext
 
-from models import get_session, LiveEvent
+from models import Session, LiveEvent, db_session
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("live-replay")
 
 
 class LiveCollector:
-    """基于 Playwright 的直播弹幕采集器"""
+    """抖音直播弹幕采集器 - 使用 JavaScript Hook WebSocket"""
 
-    def __init__(
-        self,
-        live_id: str,
-        anchor_name: str,
-        session_id: str,
-        cookie: str = "",
-    ):
+    def __init__(self, live_id: str, anchor_name: str, session_id: str,
+                 cookie: str = ""):
         self.live_id = live_id
         self.anchor_name = anchor_name
         self.session_id = session_id
@@ -50,96 +35,362 @@ class LiveCollector:
         self.error_message = ""
         self.ws_connected = False
         self.events_received = 0
-        self.room_id = ""
         self._running = False
-        self._thread: Optional[threading.Thread] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._playwright = None
         self._browser = None
-        self._page = None
-        self._chrome_proc = None  # 手动启动的 Chrome 子进程
+        self._context: Optional[BrowserContext] = None
+        self._page: Optional[Page] = None
 
-    def get_status(self) -> Dict[str, Any]:
+    def get_status(self) -> dict:
         return {
             "status": self.status,
             "error_message": self.error_message,
             "ws_connected": self.ws_connected,
             "events_received": self.events_received,
-            "room_id": self.room_id,
+            "live_id": self.live_id,
+            "anchor_name": self.anchor_name,
+            "session_id": self.session_id,
         }
 
     def start(self):
         if self._running:
             return
-
-        self.status = "starting"
         self._running = True
-
-        # 解析 room_id
+        self.status = "starting"
+        self.error_message = ""
         try:
-            self.room_id = self._resolve_room_id()
-            logger.info(f"[{self.session_id}] 解析到 room_id={self.room_id}")
+            asyncio.run(self._run())
         except Exception as e:
-            self.status = "error"
-            self.error_message = f"无法解析 room_id: {e}"
-            self._running = False
-            logger.exception(f"[{self.session_id}] 解析 room_id 失败")
-            raise
-
-        # 在后台线程运行 asyncio
-        self._thread = threading.Thread(target=self._run_async_loop, daemon=True)
-        self._thread.start()
-
-    def _run_async_loop(self):
-        """在后台线程运行 asyncio 事件循环"""
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        try:
-            self._loop.run_until_complete(self._collect())
-        except Exception as e:
-            logger.exception(f"[{self.session_id}] 采集异常: {e}")
             self.status = "error"
             self.error_message = str(e)
+            self._running = False
+            logger.exception(f"[{self.session_id}] 启动失败")
+            raise
+
+    def stop(self):
+        self._running = False
+        self.status = "stopped"
+        self.ws_connected = False
+        if self._page:
+            try:
+                asyncio.get_event_loop().run_until_complete(self._page.close())
+            except:
+                pass
+        if self._context:
+            try:
+                asyncio.get_event_loop().run_until_complete(self._context.close())
+            except:
+                pass
+        if self._browser:
+            try:
+                asyncio.get_event_loop().run_until_complete(self._browser.close())
+            except:
+                pass
+        if self._playwright:
+            try:
+                self._playwright.stop()
+            except:
+                pass
+        with db_session() as db:
+            db.query(Session).filter_by(id=self.session_id).update({
+                "ended_at": int(time.time() * 1000),
+                "is_active": False,
+            })
+
+    async def _run(self):
+        logger.info(f"[{self.session_id}] 开始采集: live_id={self.live_id}")
+
+        self._playwright = await async_playwright().start()
+
+        # 查找本地浏览器
+        exe = self._find_local_browser()
+        if exe:
+            logger.info(f"[{self.session_id}] 使用本地浏览器: {exe}")
+        else:
+            logger.info(f"[{self.session_id}] 使用 Playwright 自带浏览器")
+
+        self._browser = await self._playwright.chromium.launch(
+            headless=True,
+            executable_path=exe,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+
+        self._context = await self._browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        )
+
+        # 注入 WebSocket Hook 脚本（在页面加载前执行）
+        await self._context.add_init_script("""
+            // 存储捕获的弹幕数据
+            window.__douyin_danmaku_queue = [];
+            
+            // Hook WebSocket
+            const OriginalWebSocket = window.WebSocket;
+            
+            class HookedWebSocket extends OriginalWebSocket {
+                constructor(...args) {
+                    super(...args);
+                    
+                    // 只 hook 弹幕相关的 WebSocket
+                    const url = args[0] || '';
+                    if (url.includes('webcast/im/push') || url.includes('webcast100-ws-web')) {
+                        console.log('[Hook] 拦截到弹幕 WebSocket:', url);
+                        
+                        this.addEventListener('message', (event) => {
+                            try {
+                                // 将消息数据存入队列
+                                if (event.data instanceof ArrayBuffer) {
+                                    // 二进制数据，转为 base64 存储
+                                    const bytes = new Uint8Array(event.data);
+                                    window.__douyin_danmaku_queue.push({
+                                        type: 'binary',
+                                        data: Array.from(bytes.slice(0, 100)), // 只存前100字节
+                                        timestamp: Date.now()
+                                    });
+                                } else if (typeof event.data === 'string') {
+                                    // 文本数据
+                                    window.__douyin_danmaku_queue.push({
+                                        type: 'text',
+                                        data: event.data,
+                                        timestamp: Date.now()
+                                    });
+                                }
+                                
+                                // 限制队列大小
+                                if (window.__douyin_danmaku_queue.length > 500) {
+                                    window.__douyin_danmaku_queue = window.__douyin_danmaku_queue.slice(-200);
+                                }
+                            } catch (e) {
+                                console.error('[Hook] 处理消息失败:', e);
+                            }
+                        });
+                        
+                        this.addEventListener('open', () => {
+                            console.log('[Hook] WebSocket 连接成功');
+                            window.__ws_connected = true;
+                        });
+                        
+                        this.addEventListener('close', () => {
+                            console.log('[Hook] WebSocket 连接关闭');
+                            window.__ws_connected = false;
+                        });
+                    }
+                }
+            }
+            
+            // 替换原生 WebSocket
+            window.WebSocket = HookedWebSocket;
+            window.__ws_connected = false;
+            
+            console.log('[Hook] WebSocket Hook 已注入');
+        """)
+
+        # 注入 stealth 脚本
+        await self._context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+            window.chrome = { runtime: {} };
+        """)
+
+        # 注入 Cookie
+        if self.cookie:
+            cookie_pairs = []
+            for line in self.cookie.replace('\r', '').split('\n'):
+                line = line.strip()
+                if '=' in line and not line.startswith('#'):
+                    name, value = line.split('=', 1)
+                    cookie_pairs.append({
+                        'name': name.strip(),
+                        'value': value.strip(),
+                        'domain': '.douyin.com',
+                        'path': '/',
+                    })
+            if cookie_pairs:
+                await self._context.add_cookies(cookie_pairs)
+                logger.info(f"[{self.session_id}] 已注入 {len(cookie_pairs)} 个 Cookie")
+
+        self._page = await self._context.new_page()
+
+        # 访问直播间
+        url = f"https://live.douyin.com/{self.live_id}"
+        logger.info(f"[{self.session_id}] 访问直播间: {url}")
+
+        try:
+            await self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            logger.info(f"[{self.session_id}] 页面加载完成")
+
+            # 等待页面加载完成
+            await asyncio.sleep(5)
+
+            # 检查 WebSocket 连接状态
+            ws_connected = await self._page.evaluate("() => window.__ws_connected")
+            if ws_connected:
+                logger.info(f"[{self.session_id}] ✅ WebSocket 已连接")
+                self.ws_connected = True
+            else:
+                logger.warning(f"[{self.session_id}] ⚠️ WebSocket 未连接")
+
+            self.status = "running"
+            logger.info(f"[{self.session_id}] 采集已启动，开始从 Hook 队列读取弹幕")
+
+            # 从 Hook 队列读取弹幕
+            seen_hashes = set()
+            while self._running:
+                try:
+                    # 从 JavaScript 队列读取数据
+                    messages = await self._page.evaluate("""
+                        () => {
+                            const queue = window.__douyin_danmaku_queue || [];
+                            // 清空队列
+                            window.__douyin_danmaku_queue = [];
+                            return queue;
+                        }
+                    """)
+
+                    if messages:
+                        logger.debug(f"[{self.session_id}] Hook 队列收到 {len(messages)} 条消息")
+                        for msg in messages:
+                            if msg['type'] == 'text':
+                                # 文本消息，可能是 JSON 格式
+                                try:
+                                    data = msg['data']
+                                    # 尝试解析 JSON
+                                    import json
+                                    parsed = json.loads(data)
+                                    # 处理不同类型的消息
+                                    self._process_json_message(parsed)
+                                except:
+                                    # 不是 JSON，可能是纯文本弹幕
+                                    text = msg['data'].strip()
+                                    if text and len(text) > 2:
+                                        hash_val = hashlib.md5(text.encode()).hexdigest()[:8]
+                                        if hash_val not in seen_hashes:
+                                            seen_hashes.add(hash_val)
+                                            self._store_chat(text, '', '')
+                                            self.events_received += 1
+                                            logger.info(f"[{self.session_id}] 弹幕: {text[:50]}")
+                            elif msg['type'] == 'binary':
+                                # 二进制消息，可能是 protobuf
+                                # 记录日志但不处理（需要 protobuf 解析）
+                                logger.debug(f"[{self.session_id}] 收到二进制消息，长度: {len(msg['data'])}")
+
+                    # 限制 seen_hashes 大小
+                    if len(seen_hashes) > 1000:
+                        seen_hashes.clear()
+
+                except Exception as e:
+                    logger.debug(f"[{self.session_id}] Hook 队列查询异常: {e}")
+
+                await asyncio.sleep(0.5)
+
+        except Exception as e:
+            self.status = "error"
+            self.error_message = str(e)
+            logger.exception(f"[{self.session_id}] 运行异常")
         finally:
             self._running = False
-            self._cleanup()
+            self.ws_connected = False
+            await self._cleanup()
 
-    def _find_local_browser(self):
-        """查找本地已安装的 Chrome/Edge 浏览器"""
+    def _process_json_message(self, data: dict):
+        """处理 JSON 格式的 WebSocket 消息"""
+        try:
+            method = data.get('method', '')
+            params = data.get('params', {})
+
+            if 'chat' in method.lower() or 'message' in method.lower():
+                # 弹幕消息
+                content = params.get('content', '') or params.get('text', '')
+                user = params.get('user', {}).get('nickname', '')
+                if content:
+                    self._store_chat(content, user, '')
+                    self.events_received += 1
+                    logger.info(f"[{self.session_id}] 弹幕: {user}: {content[:50]}")
+            elif 'gift' in method.lower():
+                # 礼物消息
+                gift_name = params.get('gift_name', '')
+                user = params.get('user', {}).get('nickname', '')
+                count = params.get('count', 1)
+                if gift_name:
+                    self._store_gift(user, gift_name, count, 0)
+                    logger.info(f"[{self.session_id}] 礼物: {user} 送出 {gift_name} x{count}")
+            elif 'member' in method.lower() or 'enter' in method.lower():
+                # 进场消息
+                user = params.get('user', {}).get('nickname', '')
+                if user:
+                    self._store_enter(user)
+                    logger.info(f"[{self.session_id}] 进场: {user}")
+        except Exception as e:
+            logger.debug(f"[{self.session_id}] 处理 JSON 消息失败: {e}")
+
+    def _store_chat(self, content: str, user: str, user_id: str):
+        with db_session() as db:
+            event = LiveEvent(
+                session_id=self.session_id,
+                event_type="chat",
+                content=content,
+                user_id=user_id,
+                user_name=user,
+                raw_data="",
+            )
+            db.add(event)
+
+    def _store_gift(self, user: str, gift_name: str, count: int, value: int):
+        with db_session() as db:
+            event = LiveEvent(
+                session_id=self.session_id,
+                event_type="gift",
+                content=f"{gift_name} x{count}",
+                user_name=user,
+                raw_data="",
+            )
+            db.add(event)
+
+    def _store_enter(self, user: str):
+        with db_session() as db:
+            event = LiveEvent(
+                session_id=self.session_id,
+                event_type="enter",
+                content="",
+                user_name=user,
+                raw_data="",
+            )
+            db.add(event)
+
+    def _find_local_browser(self) -> Optional[str]:
         import os
         import platform
 
         system = platform.system()
 
-        # Chrome 常见路径
         chrome_paths = []
         edge_paths = []
 
         if system == "Windows":
-            # Windows 路径
-            local_app_data = os.environ.get("LOCALAPPDATA", "")
-            program_files = os.environ.get("PROGRAMFILES", "C:\\Program Files")
-            program_files_x86 = os.environ.get("PROGRAMFILES(X86)", "C:\\Program Files (x86)")
-
-            chrome_paths = [
-                os.path.join(local_app_data, r"Google\Chrome\Application\chrome.exe"),
-                os.path.join(program_files, r"Google\Chrome\Application\chrome.exe"),
-                os.path.join(program_files_x86, r"Google\Chrome\Application\chrome.exe"),
-            ]
-            edge_paths = [
-                os.path.join(program_files, r"Microsoft\Edge\Application\msedge.exe"),
-                os.path.join(program_files_x86, r"Microsoft\Edge\Application\msedge.exe"),
-            ]
+            for drive in ["C:", "D:", "E:", "F:"]:
+                chrome_paths.extend([
+                    f"{drive}\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+                    f"{drive}\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+                    f"{drive}\\Users\\{os.environ.get('USERNAME', '')}\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe",
+                ])
+                edge_paths.extend([
+                    f"{drive}\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+                    f"{drive}\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+                ])
         elif system == "Darwin":
-            # macOS 路径
             chrome_paths = [
                 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
             ]
             edge_paths = [
                 "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
             ]
         else:
-            # Linux 路径
             chrome_paths = [
                 "/usr/bin/google-chrome",
                 "/usr/bin/google-chrome-stable",
@@ -150,302 +401,22 @@ class LiveCollector:
                 "/usr/bin/microsoft-edge",
                 "/usr/bin/microsoft-edge-stable",
             ]
-            # WSL 环境: 可通过 /mnt/c 访问 Windows 上的 Chrome/Edge
-            if os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop") or os.path.isdir("/mnt/c/Windows"):
-                chrome_paths.extend([
-                    "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe",
-                    "/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe",
-                ])
-                edge_paths.extend([
-                    "/mnt/c/Program Files/Microsoft/Edge/Application/msedge.exe",
-                    "/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
-                ])
 
-        # 优先使用 Chrome，其次 Edge
         for path in chrome_paths + edge_paths:
-            if path and os.path.exists(path):
+            if os.path.isfile(path):
                 return path
 
         return None
 
-    async def _collect(self):
-        """主采集逻辑"""
-        from playwright.async_api import async_playwright
-        import socket
-        import subprocess
-
-        self.status = "connecting"
-
-        # 查找本地 Chrome/Edge
-        local_browser = self._find_local_browser()
-        if not local_browser:
-            self.status = "error"
-            self.error_message = "未找到本地 Chrome/Edge 浏览器，请安装 Chrome 或 Edge"
-            logger.error(f"[{self.session_id}] 未找到本地浏览器")
-            raise RuntimeError(self.error_message)
-
-        logger.info(f"[{self.session_id}] 使用本地浏览器: {local_browser}")
-
-        # WSL → Windows: Playwright 的 pipe 协议不跨边界，改用 CDP (TCP) 端口
-        # 找一个空闲端口
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            debug_port = s.getsockname()[1]
-
-        # 启动 Chrome（headless + CDP 端口）
-        chrome_args = [
-            local_browser,
-            f"--remote-debugging-port={debug_port}",
-            "--headless=new",
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-            f"--user-data-dir=/tmp/pw_chrome_{self.session_id[:8]}",
-        ]
-
-        self._chrome_proc = subprocess.Popen(
-            chrome_args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        logger.info(f"[{self.session_id}] Chrome 启动 (pid={self._chrome_proc.pid}, port={debug_port})")
-
-        # 等待 Chrome CDP 端口就绪
-        cdp_url = f"http://127.0.0.1:{debug_port}"
-        for i in range(20):
-            await asyncio.sleep(1)
-            try:
-                import urllib.request
-                req = urllib.request.Request(f"{cdp_url}/json/version")
-                with urllib.request.urlopen(req, timeout=3) as resp:
-                    if resp.status == 200:
-                        logger.info(f"[{self.session_id}] Chrome CDP 就绪 (尝试 {i+1})")
-                        break
-            except Exception:
-                pass
-        else:
-            self._chrome_proc.terminate()
-            raise RuntimeError("Chrome CDP 端口连接超时，请确认 Chrome 已安装且可正常运行")
-
-        async with async_playwright() as p:
-            # 通过 CDP 连接（TCP），绕过 Playwright 的 pipe 限制
-            self._browser = await p.chromium.connect_over_cdp(cdp_url)
-            context = await self._browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1920, "height": 1080},
-            )
-
-            # 注入登录 Cookie
-            if self.cookie:
-                cookie_pairs = []
-                for line in self.cookie.replace('\r', '').split('\n'):
-                    line = line.strip()
-                    if '=' in line and not line.startswith('#'):
-                        name, value = line.split('=', 1)
-                        cookie_pairs.append({
-                            'name': name.strip(),
-                            'value': value.strip(),
-                            'domain': '.douyin.com',
-                            'path': '/',
-                        })
-                if cookie_pairs:
-                    await context.add_cookies(cookie_pairs)
-                    logger.info(f"[{self.session_id}] 已注入 {len(cookie_pairs)} 个 Cookie")
-
-            # 注入 stealth 脚本
-            await context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
-                window.chrome = { runtime: {} };
-            """)
-
-            self._page = await context.new_page()
-
-            # 访问直播间
-            url = f"https://live.douyin.com/{self.live_id}"
-            logger.info(f"[{self.session_id}] 访问直播间: {url}")
-
-            try:
-                await self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                logger.info(f"[{self.session_id}] 页面加载完成")
-
-                # 等待页面加载完成
-                await asyncio.sleep(5)
-
-                self.status = "running"
-                logger.info(f"[{self.session_id}] 采集已启动，开始 DOM 抓取弹幕")
-
-                # DOM 抓取弹幕
-                seen_ids = set()
-                while self._running:
-                    try:
-                        # 查询弹幕元素
-                        danmakus = await self._page.evaluate("""
-                            () => {
-                                const results = [];
-                                // 抖音直播弹幕容器选择器
-                                const selectors = [
-                                    '[class*="ChatMessage"]',
-                                    '[class*="chat-message"]',
-                                    '[class*="webcast-chatroom"] [class*="item"]',
-                                    '[data-e2e="chat-message"]',
-                                    '.chat-item',
-                                ];
-                                
-                                for (const selector of selectors) {
-                                    const elements = document.querySelectorAll(selector);
-                                    elements.forEach((el, idx) => {
-                                        const text = el.innerText || el.textContent || '';
-                                        if (text.trim()) {
-                                            // 生成唯一 ID
-                                            const id = text.trim() + '_' + idx;
-                                            results.push({
-                                                id: id,
-                                                text: text.trim(),
-                                                html: el.innerHTML.substring(0, 200),
-                                            });
-                                        }
-                                    });
-                                    if (results.length > 0) break;
-                                }
-                                
-                                return results;
-                            }
-                        """)
-                        
-                        if danmakus:
-                            logger.debug(f"[{self.session_id}] DOM 抓取到 {len(danmakus)} 条弹幕")
-                            for d in danmakus:
-                                if d['id'] not in seen_ids:
-                                    seen_ids.add(d['id'])
-                                    # 存储弹幕
-                                    self._store_chat(d['text'], '', '')
-                                    self.events_received += 1
-                                    logger.info(f"[{self.session_id}] 弹幕: {d['text'][:50]}")
-                        
-                        # 限制 seen_ids 大小
-                        if len(seen_ids) > 1000:
-                            seen_ids.clear()
-                            
-                    except Exception as e:
-                        logger.debug(f"[{self.session_id}] DOM 查询异常: {e}")
-                    
-                    await asyncio.sleep(1)
-
-            except Exception as e:
-                self.status = "error"
-                self.error_message = f"页面加载失败: {e}"
-                logger.exception(f"[{self.session_id}] 页面加载失败")
-
-    def _store_chat(self, content: str, user_id: str, nickname: str):
-        """存储弹幕到数据库"""
+    async def _cleanup(self):
         try:
-            event = LiveEvent(
-                session_id=self.session_id,
-                event_type="chat",
-                user_id=user_id or "unknown",
-                nickname=nickname or "unknown",
-                content=content,
-                raw_data="",
-            )
-            db = get_session()
-            try:
-                db.add(event)
-                db.commit()
-            finally:
-                db.close()
-        except Exception as e:
-            logger.debug(f"[{self.session_id}] 保存弹幕失败: {e}")
-
-            # 发送 ACK
-            self._ws.send(ack.SerializeToString())
-            logger.debug(f"[{self.session_id}] 📤 发送 ACK: log_id={frame.log_id}")
-        except Exception as e:
-            logger.debug(f"[{self.session_id}] 发送 ACK 失败: {e}")
-
-    def _resolve_room_id(self) -> str:
-        """解析直播间 room_id"""
-        # 清洗 live_id，支持完整 URL
-        live_id = self.live_id
-        m = re.search(r"live\.douyin\.com/([^/?#]+)", live_id)
-        if m:
-            live_id = m.group(1)
-
-        # 纯数字 live_id 直接当作 room_id 使用
-        if live_id.isdigit():
-            logger.info(f"[{self.session_id}] live_id 是纯数字，直接作为 room_id={live_id}")
-            return live_id
-
-        url = f"https://live.douyin.com/{live_id}"
-        # 将多行 key=value cookie 转成 HTTP header 单行格式
-        cookie_header = self.cookie.replace('\n', '; ').replace('\r', '')
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Cookie": cookie_header,
-        }
-
-        try:
-            resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
-            resp.raise_for_status()
-            html = resp.text
-
-            # 从页面中提取 room_id
-            match = re.search(r'"roomId":"(\d+)"', html)
-            if match:
-                return match.group(1)
-
-            match = re.search(r'"room_id":(\d+)', html)
-            if match:
-                return match.group(1)
-
-            # 从 URL 中提取
-            match = re.search(r"live\.douyin\.com/(\d+)", resp.url)
-            if match:
-                return match.group(1)
-
-
-        except Exception as e:
-            logger.warning(f"[{self.session_id}] HTTP 提取 roomId 失败: {e}")
-
-        logger.warning(f"[{self.session_id}] HTTP 无法提取 roomId，使用 live_id={live_id} 兜底")
-        return live_id
-
-    def stop(self):
-        """停止采集"""
-        self._running = False
-        self.status = "stopped"
-        self.ws_connected = False
-        self._cleanup()
-
-        db = get_session()
-        try:
-            from sqlalchemy import update
-            from models import LiveSession
-            db.execute(
-                update(LiveSession)
-                .where(LiveSession.id == self.session_id)
-                .values(ended_at=datetime.now())
-            )
-            db.commit()
-        except Exception as e:
-            logger.error(f"[{self.session_id}] 更新 session 失败: {e}")
-            db.rollback()
-        finally:
-            db.close()
-
-    def _cleanup(self):
-        """清理资源"""
-        try:
+            if self._page:
+                await self._page.close()
+            if self._context:
+                await self._context.close()
             if self._browser:
-                asyncio.run_coroutine_threadsafe(self._browser.close(), self._loop)
-        except Exception:
-            pass
-        try:
-            if self._chrome_proc:
-                self._chrome_proc.terminate()
-                self._chrome_proc = None
-        except Exception:
-            pass
+                await self._browser.close()
+            if self._playwright:
+                self._playwright.stop()
+        except Exception as e:
+            logger.debug(f"[{self.session_id}] 清理资源异常: {e}")
