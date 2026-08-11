@@ -25,8 +25,9 @@ from typing import Optional, Callable, Dict, Any
 
 import requests
 
-from models import SessionLocal, LiveEvent
+from models import get_session, LiveEvent
 
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -55,6 +56,7 @@ class LiveCollector:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._browser = None
         self._page = None
+        self._chrome_proc = None  # 手动启动的 Chrome 子进程
 
     def get_status(self) -> Dict[str, Any]:
         return {
@@ -148,6 +150,16 @@ class LiveCollector:
                 "/usr/bin/microsoft-edge",
                 "/usr/bin/microsoft-edge-stable",
             ]
+            # WSL 环境: 可通过 /mnt/c 访问 Windows 上的 Chrome/Edge
+            if os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop") or os.path.isdir("/mnt/c/Windows"):
+                chrome_paths.extend([
+                    "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe",
+                    "/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe",
+                ])
+                edge_paths.extend([
+                    "/mnt/c/Program Files/Microsoft/Edge/Application/msedge.exe",
+                    "/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+                ])
 
         # 优先使用 Chrome，其次 Edge
         for path in chrome_paths + edge_paths:
@@ -159,35 +171,88 @@ class LiveCollector:
     async def _collect(self):
         """主采集逻辑"""
         from playwright.async_api import async_playwright
+        import socket
+        import subprocess
 
         self.status = "connecting"
-        logger.info(f"[{self.session_id}] 启动浏览器...")
 
-        # 尝试使用本地浏览器
+        # 查找本地 Chrome/Edge
         local_browser = self._find_local_browser()
-        if local_browser:
-            logger.info(f"[{self.session_id}] 使用本地浏览器: {local_browser}")
+        if not local_browser:
+            self.status = "error"
+            self.error_message = "未找到本地 Chrome/Edge 浏览器，请安装 Chrome 或 Edge"
+            logger.error(f"[{self.session_id}] 未找到本地浏览器")
+            raise RuntimeError(self.error_message)
+
+        logger.info(f"[{self.session_id}] 使用本地浏览器: {local_browser}")
+
+        # WSL → Windows: Playwright 的 pipe 协议不跨边界，改用 CDP (TCP) 端口
+        # 找一个空闲端口
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            debug_port = s.getsockname()[1]
+
+        # 启动 Chrome（headless + CDP 端口）
+        chrome_args = [
+            local_browser,
+            f"--remote-debugging-port={debug_port}",
+            "--headless=new",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            f"--user-data-dir=/tmp/pw_chrome_{self.session_id[:8]}",
+        ]
+
+        self._chrome_proc = subprocess.Popen(
+            chrome_args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        logger.info(f"[{self.session_id}] Chrome 启动 (pid={self._chrome_proc.pid}, port={debug_port})")
+
+        # 等待 Chrome CDP 端口就绪
+        cdp_url = f"http://127.0.0.1:{debug_port}"
+        for i in range(20):
+            await asyncio.sleep(1)
+            try:
+                import urllib.request
+                req = urllib.request.Request(f"{cdp_url}/json/version")
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    if resp.status == 200:
+                        logger.info(f"[{self.session_id}] Chrome CDP 就绪 (尝试 {i+1})")
+                        break
+            except Exception:
+                pass
+        else:
+            self._chrome_proc.terminate()
+            raise RuntimeError("Chrome CDP 端口连接超时，请确认 Chrome 已安装且可正常运行")
 
         async with async_playwright() as p:
-            # 启动浏览器（使用 stealth 模式）
-            launch_opts = {
-                "headless": True,
-                "args": [
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
-            }
-            if local_browser:
-                launch_opts["executable_path"] = local_browser
-
-            self._browser = await p.chromium.launch(**launch_opts)
-
+            # 通过 CDP 连接（TCP），绕过 Playwright 的 pipe 限制
+            self._browser = await p.chromium.connect_over_cdp(cdp_url)
             context = await self._browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 viewport={"width": 1920, "height": 1080},
             )
+
+            # 注入登录 Cookie
+            if self.cookie:
+                cookie_pairs = []
+                for line in self.cookie.replace('\r', '').split('\n'):
+                    line = line.strip()
+                    if '=' in line and not line.startswith('#'):
+                        name, value = line.split('=', 1)
+                        cookie_pairs.append({
+                            'name': name.strip(),
+                            'value': value.strip(),
+                            'domain': '.douyin.com',
+                            'path': '/',
+                        })
+                if cookie_pairs:
+                    await context.add_cookies(cookie_pairs)
+                    logger.info(f"[{self.session_id}] 已注入 {len(cookie_pairs)} 个 Cookie")
 
             # 注入 stealth 脚本
             await context.add_init_script("""
@@ -235,36 +300,57 @@ class LiveCollector:
         logger.info(f"[{self.session_id}] 拦截到 WebSocket: {url[:80]}...")
         self.ws_connected = True
 
-        async def on_message(message):
-            try:
-                if isinstance(message, bytes):
-                    self._process_message(message)
-            except Exception as e:
-                logger.debug(f"[{self.session_id}] 消息处理错误: {e}")
+        def _on_frame(frame):
+            # CDP 模式直接传 bytes；pipe 模式传 WebSocketFrame 对象
+            if isinstance(frame, bytes):
+                payload = frame
+            elif hasattr(frame, "payload"):
+                payload = frame.payload
+            elif isinstance(frame, dict):
+                payload = frame.get("payload", b"")
+            else:
+                payload = b""
+            if isinstance(payload, bytes) and payload:
+                logger.info(f"[{self.session_id}] WS 帧 {len(payload)} bytes")
+                self._process_message(payload)
 
-        ws.on("framereceived", lambda data: on_message(data.get("payload", b"") if isinstance(data, dict) else data))
+        ws.on("framereceived", _on_frame)
+        ws.on("close", lambda: logger.info(f"[{self.session_id}] WS 连接关闭"))
+        ws.on("error", lambda err: logger.info(f"[{self.session_id}] WS 错误: {err}"))
 
     def _process_message(self, data: bytes):
         """处理 WebSocket 消息"""
         try:
-            from douyin_pb import PushFrame, Response, ChatMessage, MemberMessage, GiftMessage, LikeMessage
+            from vendor.douyin_pb import PushFrame, Response, ChatMessage, MemberMessage, GiftMessage, LikeMessage
 
             # 解析 PushFrame
             frame = PushFrame().parse(data)
 
-            # 解压 payload
+            # 解压 payload（encoding 可能缺失，自动检测 gzip 头）
             if frame.payload_encoding == b"gzip":
+                payload = gzip.decompress(frame.payload)
+            elif frame.payload[:2] == b"\x1f\x8b":
+                # 自动检测 gzip 魔法头
                 payload = gzip.decompress(frame.payload)
             else:
                 payload = frame.payload
+
+            logger.info(f"[{self.session_id}] 解压后 {len(payload)} bytes, encoding={frame.payload_encoding}")
 
             if not payload:
                 return
 
             # 解析 Response
-            response = Response().parse(payload)
+            try:
+                response = Response().parse(payload)
+            except Exception as e:
+                logger.warning(f"[{self.session_id}] Response 解析失败 ({type(e).__name__}), payload:{payload[:20].hex()}")
+                return
 
             # 处理消息
+            msg_count = len(response.messages_list)
+            if msg_count > 0:
+                logger.info(f"[{self.session_id}] 解析到 {msg_count} 条消息")
             for msg in response.messages_list:
                 method = msg.method
                 payload_data = msg.payload
@@ -286,7 +372,7 @@ class LiveCollector:
                     logger.debug(f"[{self.session_id}] 解析 {method} 失败: {e}")
 
         except Exception as e:
-            logger.debug(f"[{self.session_id}] 消息解析失败: {e}")
+            logger.warning(f"[{self.session_id}] 消息解析失败: {type(e).__name__}: {e}")
 
     def _handle_chat(self, msg):
         """处理弹幕消息"""
@@ -357,7 +443,7 @@ class LiveCollector:
 
     def _save_event(self, event: LiveEvent):
         """保存事件到数据库"""
-        db = SessionLocal()
+        db = get_session()
         try:
             db.add(event)
             db.commit()
@@ -376,30 +462,44 @@ class LiveCollector:
         if m:
             live_id = m.group(1)
 
+        # 纯数字 live_id 直接当作 room_id 使用
+        if live_id.isdigit():
+            logger.info(f"[{self.session_id}] live_id 是纯数字，直接作为 room_id={live_id}")
+            return live_id
+
         url = f"https://live.douyin.com/{live_id}"
+        # 将多行 key=value cookie 转成 HTTP header 单行格式
+        cookie_header = self.cookie.replace('\n', '; ').replace('\r', '')
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Cookie": self.cookie,
+            "Cookie": cookie_header,
         }
 
-        resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
-        resp.raise_for_status()
+        try:
+            resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+            resp.raise_for_status()
+            html = resp.text
 
-        # 从页面中提取 room_id
-        match = re.search(r'"roomId":"(\d+)"', resp.text)
-        if match:
-            return match.group(1)
+            # 从页面中提取 room_id
+            match = re.search(r'"roomId":"(\d+)"', html)
+            if match:
+                return match.group(1)
 
-        match = re.search(r'"room_id":(\d+)', resp.text)
-        if match:
-            return match.group(1)
+            match = re.search(r'"room_id":(\d+)', html)
+            if match:
+                return match.group(1)
 
-        # 从 URL 中提取
-        match = re.search(r"live\.douyin\.com/(\d+)", resp.url)
-        if match:
-            return match.group(1)
+            # 从 URL 中提取
+            match = re.search(r"live\.douyin\.com/(\d+)", resp.url)
+            if match:
+                return match.group(1)
+        except Exception:
+            pass
 
-        raise RuntimeError("无法从页面中提取 room_id")
+        # 兜底: 抖音页面现在全 React 渲染，HTTP 请求拿不到 roomId
+        # 直接用 live_id，实际 WebSocket 拦截不依赖 room_id
+        logger.warning(f"[{self.session_id}] HTTP 无法提取 roomId，使用 live_id={live_id} 兜底")
+        return live_id
 
     def stop(self):
         """停止采集"""
@@ -408,7 +508,7 @@ class LiveCollector:
         self.ws_connected = False
         self._cleanup()
 
-        db = SessionLocal()
+        db = get_session()
         try:
             from sqlalchemy import update
             from models import LiveSession
@@ -429,5 +529,11 @@ class LiveCollector:
         try:
             if self._browser:
                 asyncio.run_coroutine_threadsafe(self._browser.close(), self._loop)
+        except Exception:
+            pass
+        try:
+            if self._chrome_proc:
+                self._chrome_proc.terminate()
+                self._chrome_proc = None
         except Exception:
             pass
