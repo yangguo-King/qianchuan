@@ -245,6 +245,11 @@ class LiveCollector:
 
     def _resolve_room_id(self) -> Optional[str]:
         """从直播间 URL 解析真实 room_id"""
+        # 清洗 live_id：如果用户输入完整 URL，提取最后一部分
+        m = re.search(r'live\.douyin\.com/([^/?#]+)', self.live_id)
+        if m:
+            self.live_id = m.group(1)
+        
         url = f"https://live.douyin.com/{self.live_id}"
         headers = {
             "User-Agent": self.user_agent,
@@ -320,9 +325,13 @@ class LiveCollector:
     def _ws_on_message(self, ws, message):
         """处理 WebSocket 消息"""
         try:
+            logger.debug(f"[{self.session_id}] 收到消息，长度: {len(message)}")
+            
             # 解析 protobuf
             package = PushFrame().parse(message)
             response = Response().parse(gzip.decompress(package.payload))
+            
+            logger.debug(f"[{self.session_id}] 解析成功，消息数: {len(response.messages_list)}, need_ack: {response.need_ack}")
             
             # 发送 ACK
             if response.need_ack:
@@ -335,10 +344,11 @@ class LiveCollector:
             
             # 处理消息列表
             for msg in response.messages_list:
+                logger.info(f"[{self.session_id}] 处理消息类型: {msg.method}")
                 self._dispatch(msg.method, msg.payload)
                 
         except Exception as e:
-            logger.error(f"[{self.session_id}] 解析消息失败: {e}")
+            logger.error(f"[{self.session_id}] 解析消息失败: {e}", exc_info=True)
 
     def _ws_on_error(self, ws, error):
         """WebSocket 错误"""
