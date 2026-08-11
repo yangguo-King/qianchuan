@@ -101,6 +101,61 @@ class LiveCollector:
             self._running = False
             self._cleanup()
 
+    def _find_local_browser(self):
+        """查找本地已安装的 Chrome/Edge 浏览器"""
+        import os
+        import platform
+
+        system = platform.system()
+
+        # Chrome 常见路径
+        chrome_paths = []
+        edge_paths = []
+
+        if system == "Windows":
+            # Windows 路径
+            local_app_data = os.environ.get("LOCALAPPDATA", "")
+            program_files = os.environ.get("PROGRAMFILES", "C:\\Program Files")
+            program_files_x86 = os.environ.get("PROGRAMFILES(X86)", "C:\\Program Files (x86)")
+
+            chrome_paths = [
+                os.path.join(local_app_data, r"Google\Chrome\Application\chrome.exe"),
+                os.path.join(program_files, r"Google\Chrome\Application\chrome.exe"),
+                os.path.join(program_files_x86, r"Google\Chrome\Application\chrome.exe"),
+            ]
+            edge_paths = [
+                os.path.join(program_files, r"Microsoft\Edge\Application\msedge.exe"),
+                os.path.join(program_files_x86, r"Microsoft\Edge\Application\msedge.exe"),
+            ]
+        elif system == "Darwin":
+            # macOS 路径
+            chrome_paths = [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            ]
+            edge_paths = [
+                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            ]
+        else:
+            # Linux 路径
+            chrome_paths = [
+                "/usr/bin/google-chrome",
+                "/usr/bin/google-chrome-stable",
+                "/usr/bin/chromium",
+                "/usr/bin/chromium-browser",
+            ]
+            edge_paths = [
+                "/usr/bin/microsoft-edge",
+                "/usr/bin/microsoft-edge-stable",
+            ]
+
+        # 优先使用 Chrome，其次 Edge
+        for path in chrome_paths + edge_paths:
+            if path and os.path.exists(path):
+                return path
+
+        return None
+
     async def _collect(self):
         """主采集逻辑"""
         from playwright.async_api import async_playwright
@@ -108,17 +163,26 @@ class LiveCollector:
         self.status = "connecting"
         logger.info(f"[{self.session_id}] 启动浏览器...")
 
+        # 尝试使用本地浏览器
+        local_browser = self._find_local_browser()
+        if local_browser:
+            logger.info(f"[{self.session_id}] 使用本地浏览器: {local_browser}")
+
         async with async_playwright() as p:
             # 启动浏览器（使用 stealth 模式）
-            self._browser = await p.chromium.launch(
-                headless=True,
-                args=[
+            launch_opts = {
+                "headless": True,
+                "args": [
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                 ],
-            )
+            }
+            if local_browser:
+                launch_opts["executable_path"] = local_browser
+
+            self._browser = await p.chromium.launch(**launch_opts)
 
             context = await self._browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
