@@ -301,6 +301,7 @@ class LiveCollector:
 
         logger.info(f"[{self.session_id}] ✅ 拦截到弹幕 WebSocket: {url[:80]}...")
         self.ws_connected = True
+        self._ws = ws  # 保存 WebSocket 引用用于发送 ACK
 
         def _on_frame(frame):
             # CDP 模式直接传 bytes；pipe 模式传 WebSocketFrame 对象
@@ -315,6 +316,8 @@ class LiveCollector:
             if isinstance(payload, bytes) and payload:
                 logger.info(f"[{self.session_id}] 📦 WS 帧 {len(payload)} bytes")
                 self._process_message(payload)
+                # 发送 ACK 确认收到
+                self._send_ack(payload)
             else:
                 logger.debug(f"[{self.session_id}] 空帧或无效帧: type={type(frame)}")
 
@@ -461,6 +464,26 @@ class LiveCollector:
             db.rollback()
         finally:
             db.close()
+
+    def _send_ack(self, frame_data: bytes):
+        """发送 ACK 确认消息"""
+        if not hasattr(self, '_ws') or self._ws is None:
+            return
+        try:
+            # 解析收到的帧获取 log_id
+            frame = douyin_pb2.PushFrame()
+            frame.ParseFromString(frame_data)
+
+            # 构造 ACK 响应
+            ack = douyin_pb2.PushFrame()
+            ack.payload_type = "ack"
+            ack.log_id = frame.log_id
+
+            # 发送 ACK
+            self._ws.send(ack.SerializeToString())
+            logger.debug(f"[{self.session_id}] 📤 发送 ACK: log_id={frame.log_id}")
+        except Exception as e:
+            logger.debug(f"[{self.session_id}] 发送 ACK 失败: {e}")
 
     def _resolve_room_id(self) -> str:
         """解析直播间 room_id"""
