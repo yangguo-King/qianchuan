@@ -319,7 +319,7 @@ class LiveCollector:
             logger.warning(f"[{self.session_id}] 分发 {method} 失败: {e}")
 
     def _get_flv_url(self) -> str:
-        """获取直播流 FLV 地址"""
+        """获取直播流地址（优先 HLS，其次 FLV）"""
         url = f"https://live.douyin.com/webcast/room/web/enter/?aid=6383&live_id=1&device_platform=web&language=zh-CN&enter_from=web_live&cookie_enabled=true&browser_language=zh-CN&browser_platform=Win32&browser_name=Mozilla&browser_version=5.0&web_rid={self.live_id}"
         headers = {"User-Agent": self.user_agent, "cookie": f"ttwid={self._ttwid}"}
         resp = requests.get(url, headers=headers, timeout=10)
@@ -329,18 +329,28 @@ class LiveCollector:
         
         room_info = data.get("data", {}).get("data", [{}])[0]
         stream_url = room_info.get("stream_url", {})
-        flv_pull_url = stream_url.get("flv_pull_url", {})
         
-        # 优先选择原画
+        # 优先尝试 HLS 流（token 有效期通常更长）
+        hls_pull_url = stream_url.get("hls_pull_url", {})
+        for quality in ["FULL_HD1", "HD1", "SD1", "SD2"]:
+            if quality in hls_pull_url:
+                logger.info(f"[{self.session_id}] 使用 HLS 流 ({quality})")
+                return hls_pull_url[quality]
+        
+        # 其次尝试 FLV 流
+        flv_pull_url = stream_url.get("flv_pull_url", {})
         for quality in ["FULL_HD1", "HD1", "SD1", "SD2"]:
             if quality in flv_pull_url:
+                logger.info(f"[{self.session_id}] 使用 FLV 流 ({quality})")
                 return flv_pull_url[quality]
         
         # 返回第一个可用的
+        if hls_pull_url:
+            return list(hls_pull_url.values())[0]
         if flv_pull_url:
             return list(flv_pull_url.values())[0]
         
-        raise RuntimeError("无法获取 FLV 地址")
+        raise RuntimeError("无法获取直播流地址")
 
     def _start_recording(self):
         """启动 ffmpeg 录屏"""
