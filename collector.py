@@ -320,8 +320,8 @@ class LiveCollector:
 
     def _get_flv_url(self) -> str:
         """获取直播流地址（优先 HLS，其次 FLV）"""
-        url = f"https://live.douyin.com/webcast/room/web/enter/?aid=6383&live_id=1&device_platform=web&language=zh-CN&enter_from=web_live&cookie_enabled=true&browser_language=zh-CN&browser_platform=Win32&browser_name=Mozilla&browser_version=5.0&web_rid={self.live_id}"
-        headers = {"User-Agent": self.user_agent, "cookie": f"ttwid={self._ttwid}"}
+        url = f"https://live.douyin.com/webcast/room/web/enter/?aid=6383&live_id=1&device_platform=web&language=zh-CN&enter_from=web_live&cookie_enabled=true&browser_language=zh-CN&browser_platform=Win32&browser_name=Mozilla&browser_version=5.0&web_rid={self._room_id}"
+        headers = {"User-Agent": self.user_agent, "cookie": f"ttwid={self.ttwid}"}
         resp = requests.get(url, headers=headers, timeout=10)
         data = resp.json()
         if data.get("status_code") != 0:
