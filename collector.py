@@ -360,18 +360,41 @@ class LiveCollector:
                 "ffmpeg", "-i", flv_url,
                 "-c", "copy",  # 直接复制流，不重新编码
                 "-y",  # 覆盖已存在的文件
+                "-timeout", "10000000",  # 10秒超时
                 str(output_file)
             ]
             
+            # 使用 PIPE 捕获 stderr 以便调试
             self._recording_proc = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
             self._recording_file = output_file
             logger.info(f"[{self.session_id}] 录屏已启动: {output_file}")
             
+            # 启动一个线程监控 ffmpeg 输出
+            threading.Thread(target=self._monitor_recording, daemon=True).start()
+            
         except Exception as e:
             logger.warning(f"[{self.session_id}] 录屏启动失败（非致命）: {e}")
             self._recording_proc = None
+
+    def _monitor_recording(self):
+        """监控 ffmpeg 输出，记录错误"""
+        try:
+            # 等待进程结束并获取输出
+            _, stderr = self._recording_proc.communicate(timeout=30)
+            if self._recording_proc.returncode != 0:
+                logger.warning(f"[{self.session_id}] ffmpeg 退出码: {self._recording_proc.returncode}")
+                if stderr:
+                    # 只记录最后几行错误
+                    lines = stderr.decode('utf-8', errors='ignore').strip().split('\n')
+                    for line in lines[-5:]:
+                        logger.warning(f"[{self.session_id}] ffmpeg: {line}")
+        except subprocess.TimeoutExpired:
+            # 进程还在运行，这是正常的
+            pass
+        except Exception as e:
+            logger.debug(f"[{self.session_id}] 录屏监控异常: {e}")
 
     def _save_event(self, event_type: str, data: dict):
         """保存事件到数据库"""
