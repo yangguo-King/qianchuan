@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import Optional
 
 import gzip
+import subprocess
 import requests
 import websocket
 from py_mini_racer import MiniRacer
@@ -75,7 +76,10 @@ class LiveCollector:
             self._resolve_room_id()
             logger.info(f"[{self.session_id}] 解析到 room_id={self.room_id}")
 
-            # 3. 连接 WebSocket
+            # 3. 启动录屏
+            self._start_recording()
+
+            # 4. 连接 WebSocket
             self._connect_websocket()
 
             self._running = True
@@ -313,6 +317,61 @@ class LiveCollector:
 
         except Exception as e:
             logger.warning(f"[{self.session_id}] 分发 {method} 失败: {e}")
+
+    def _get_flv_url(self) -> str:
+        """获取直播流 FLV 地址"""
+        url = f"https://live.douyin.com/webcast/room/web/enter/?aid=6383&live_id=1&device_platform=web&language=zh-CN&enter_from=web_live&cookie_enabled=true&browser_language=zh-CN&browser_platform=Win32&browser_name=Mozilla&browser_version=5.0&web_rid={self.live_id}"
+        headers = {"User-Agent": self.user_agent, "cookie": f"ttwid={self._ttwid}"}
+        resp = requests.get(url, headers=headers, timeout=10)
+        data = resp.json()
+        if data.get("status_code") != 0:
+            raise RuntimeError(f"获取直播流失败: {data}")
+        
+        room_info = data.get("data", {}).get("data", [{}])[0]
+        stream_url = room_info.get("stream_url", {})
+        flv_pull_url = stream_url.get("flv_pull_url", {})
+        
+        # 优先选择原画
+        for quality in ["FULL_HD1", "HD1", "SD1", "SD2"]:
+            if quality in flv_pull_url:
+                return flv_pull_url[quality]
+        
+        # 返回第一个可用的
+        if flv_pull_url:
+            return list(flv_pull_url.values())[0]
+        
+        raise RuntimeError("无法获取 FLV 地址")
+
+    def _start_recording(self):
+        """启动 ffmpeg 录屏"""
+        try:
+            flv_url = self._get_flv_url()
+            logger.info(f"[{self.session_id}] 获取到 FLV 地址")
+            
+            # 确保输出目录存在
+            VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+            
+            # 生成输出文件名
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = VIDEO_DIR / f"{self.anchor_name}_{timestamp}.mp4"
+            
+            # 启动 ffmpeg 录制
+            cmd = [
+                "ffmpeg", "-i", flv_url,
+                "-c", "copy",  # 直接复制流，不重新编码
+                "-y",  # 覆盖已存在的文件
+                str(output_file)
+            ]
+            
+            self._recording_proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            self._recording_file = output_file
+            logger.info(f"[{self.session_id}] 录屏已启动: {output_file}")
+            
+        except Exception as e:
+            logger.warning(f"[{self.session_id}] 录屏启动失败（非致命）: {e}")
+            self._recording_proc = None
 
     def _save_event(self, event_type: str, data: dict):
         """保存事件到数据库"""
